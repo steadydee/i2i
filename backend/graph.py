@@ -1,92 +1,80 @@
 # -*- coding: utf-8 -*-
 """
 i2i LangGraph workflow
-Intent ─► Gather ─► Process ─► Deliver
-• Gather now fetches task metadata from Supabase.
+──────────────────────────────────────────────────────────────────────────────
+User text  ─► Intent  ─► Gather (Supabase) ─► Process (processor_chain) ─► Deliver
 """
-
 from __future__ import annotations
-
-import os
 from typing import TypedDict, Any
-from dotenv import load_dotenv   #  ← add
-load_dotenv()                    #  ← add; reads .env into os.environ
-from langgraph.graph import StateGraph            # pip install langgraph
-from supabase import create_client                # pip install supabase
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Supabase lazy‑loaded singleton
-# ─────────────────────────────────────────────────────────────────────────────
-_SB = None
+from langgraph.graph import StateGraph
+
+from backend.db import sb            # ← shared Supabase client
+from backend.processors import REG   # ← registry of LangChain runnables
 
 
-def sb():
-    """Return a cached Supabase client."""
-    global _SB
-    if _SB is None:
-        _SB = create_client(
-            os.environ["SUPABASE_URL"],
-            os.environ["SUPABASE_SERVICE_KEY"],
-        )
-    return _SB
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LangGraph shared state
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# LangGraph state
+# ────────────────────────────────────────────────────────────────────────────
 class WorkflowState(TypedDict, total=False):
-    user_input: str          # raw prompt from the UI
-    task: str                # canonical task id (e.g. draft_sow)
-    gathered: dict           # task‑manifest row fetched in Gather
-    result: Any              # output from processor chain
-    response: str            # final human‑facing reply
+    user_input: str                # raw prompt from Streamlit
+    task: str                      # canonical task id (draft_sow / policy_qna)
+    gathered: dict                 # task-manifest row pulled in Gather
+    result: Any                    # output from processor chain
+    response: str                  # human-facing reply for the UI
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Graph nodes
-# ─────────────────────────────────────────────────────────────────────────────
-def intent_node(s: WorkflowState) -> WorkflowState:
-    """VERY naive router for demo purposes."""
-    text = s["user_input"].lower()
-    s["task"] = "draft_sow" if "sow" in text else "policy_qna"
-    return s
+# ────────────────────────────────────────────────────────────────────────────
+# Nodes
+# ────────────────────────────────────────────────────────────────────────────
+def intent_node(state: WorkflowState) -> WorkflowState:
+    """Naïve keyword router; swap in classifier later."""
+    txt = state["user_input"].lower()
+    state["task"] = "draft_sow" if "sow" in txt else "policy_qna"
+    return state
 
 
-def gather_node(s: WorkflowState) -> WorkflowState:
-    """Pull the task_manifest row (and any metadata) from Supabase."""
-    row = (
+def gather_node(state: WorkflowState) -> WorkflowState:
+    """Fetch task-manifest row from Supabase."""
+    resp = (
         sb()
         .table("task_manifest")
         .select("*")
-        .eq("task", s["task"])
-        .single()
+        .eq("task", state["task"])
+        .limit(1)
         .execute()
-        .data
     )
-    if not row:
-        raise ValueError(f"No task_manifest row found for '{s['task']}'")
-    s["gathered"] = row
-    return s
+    row = resp.data[0] if resp.data else None
+    if row is None:
+        raise ValueError(f"No task_manifest row found for task='{state['task']}'")
+    state["gathered"] = row
+    return state
 
 
-def process_node(s: WorkflowState) -> WorkflowState:
-    """Call the processor_chain specified in the manifest.
-    For now we stub it out so the app still runs."""
-    if s["task"] == "draft_sow":
-        s["result"] = f"(stub) Generated SOW for: {s['user_input']}"
-    else:
-        s["result"] = f"(stub) Answered policy Q&A for: {s['user_input']}"
-    return s
+def process_node(state: WorkflowState) -> WorkflowState:
+    """Run the registered processor chain for this task."""
+    chain_id = state["gathered"]["processor_chain_id"]
+    chain = REG.get(chain_id)
+    if chain is None:
+        raise ValueError(f"No processor registered for '{chain_id}'")
+
+    inputs = {
+        "user_input": state["user_input"],
+        "metadata":   state["gathered"].get("metadata", {}),
+    }
+    state["result"] = chain.invoke(inputs)
+    return state
 
 
-def deliver_node(s: WorkflowState) -> WorkflowState:
-    s["response"] = str(s.get("result", "(no result)"))
-    return s
+def deliver_node(state: WorkflowState) -> WorkflowState:
+    """Return whatever Process produced as a UI-friendly string."""
+    state["response"] = str(state.get("result", "(no result)"))
+    return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build and compile the LangGraph
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# Build & compile the graph
+# ────────────────────────────────────────────────────────────────────────────
 builder = StateGraph(WorkflowState)
 
 builder.add_node("Intent", intent_node)
@@ -103,7 +91,8 @@ builder.set_finish_point("Deliver")
 graph = builder.compile()
 
 
-# Helper for Streamlit
-def run_workflow(text: str) -> str:
-    final_state = graph.invoke({"user_input": text})
+# Convenience helper for Streamlit
+def run_workflow(prompt: str) -> str:
+    """Run the entire graph and return the UI string."""
+    final_state = graph.invoke({"user_input": prompt})
     return final_state["response"]
