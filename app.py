@@ -1,65 +1,48 @@
 import streamlit as st
 from backend.graph import run_workflow
-
-st.set_page_config(page_title="i2i demo")
-
-# ── persistent UI state ─────────────────────────────────────────────
-if "pending_fields" not in st.session_state:
-    st.session_state.pending_fields = None
-if "last_prompt" not in st.session_state:
-    st.session_state.last_prompt = ""
+from utils.fields import render_fields          # generic field renderer
 
 st.title("i2i demo")
 
-# ── 1️⃣  prompt stage ────────────────────────────────────────────────
-if st.session_state.pending_fields is None:
-    prompt = st.text_input("What do you need?")
-    if st.button("Send") and prompt:
-        st.session_state.last_prompt = prompt
-        event = run_workflow(prompt)
+# ───────────────── session helpers ────────────────────────
+state = st.session_state
+state.setdefault("prompt", "")
+state.setdefault("event", None)    # last workflow response
 
-        if event["ui_event"] == "form":
-            st.session_state.pending_fields = event["fields"]
-            st.rerun()
+# ─────────────────── one-button form ──────────────────────
+with st.form("main"):
+    state.prompt = st.text_input("What do you need?", value=state.prompt)
 
-        elif event["ui_event"] == "text":
-            st.markdown(event["content"])
+    extra_data = {}
+    valid = True
+    evt = state.event
+    if evt and evt["ui_event"] == "form":
+        extra_data, valid = render_fields(evt["fields"])
 
-        elif event["ui_event"] == "download_link":
-            st.markdown(f"[Download the document]({event['url']})")
+    submitted = st.form_submit_button("Submit")
 
-# ── 2️⃣  dynamic form stage ──────────────────────────────────────────
-else:
-    st.subheader("Please provide a few details:")
-    with st.form("dynamic_form"):
-        inputs: dict[str, object] = {}
-        for fld in st.session_state.pending_fields:
-            name   = fld["name"]
-            label  = fld.get("label", name.replace("_", " ").title())
-            widget = fld["widget"]
+# ─────────────── handle Submit click(s) ───────────────────
+if submitted:
+    # 1st click – only prompt exists
+    if evt is None or evt["ui_event"] != "form":
+        state.event = run_workflow(state.prompt)
+        st.rerun()
 
-            if widget == "text_input":
-                inputs[name] = st.text_input(label)
+    # 2nd click – prompt + form data
+    elif valid:
+        state.event = run_workflow(state.prompt, extra_data)
+        st.rerun()
 
-            elif widget == "number_input":
-                kwargs = fld.get("widget_kwargs", {})
-                inputs[name] = st.number_input(label, **kwargs)
+# ─────────────────── final output ─────────────────────────
+evt = state.event
+if evt and evt["ui_event"] == "download_link":
+    st.markdown(f"[Download the document]({evt['url']})", unsafe_allow_html=True)
+    if st.button("🔄 Start over"):
+        state.clear()
+        st.rerun()
 
-        submitted = st.form_submit_button("Submit")
-
-    if submitted:
-        event = run_workflow(
-            st.session_state.last_prompt,
-            form_data=inputs,
-        )
-
-        # ── DEBUG ──────────────────────────────────────────────────
-        st.write("DEBUG event:", event)
-
-        st.session_state.pending_fields = None
-
-        if event["ui_event"] == "text":
-            st.markdown(event["content"])
-
-        elif event["ui_event"] == "download_link":
-            st.markdown(f"[Download the document]({event['url']})")
+elif evt and evt["ui_event"] == "text":
+    st.write(evt["content"])
+    if st.button("🔄 Start over"):
+        state.clear()
+        st.rerun()
