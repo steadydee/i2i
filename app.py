@@ -1,48 +1,38 @@
 import streamlit as st
+from typing import Dict, Any
 from backend.graph import run_workflow
-from utils.fields import render_fields          # generic field renderer
+from utils.fields import render_fields
 
-st.title("i2i demo")
+st.set_page_config(page_title="i2i demo")
 
-# ───────────────── session helpers ────────────────────────
-state = st.session_state
-state.setdefault("prompt", "")
-state.setdefault("event", None)    # last workflow response
+prompt = st.text_input("What do you need?")
 
-# ─────────────────── one-button form ──────────────────────
-with st.form("main"):
-    state.prompt = st.text_input("What do you need?", value=state.prompt)
+# Call the graph as soon as user hits Enter in the text box
+if prompt and "event" not in st.session_state:
+    st.session_state.event = run_workflow(prompt)
 
-    extra_data = {}
-    valid = True
-    evt = state.event
-    if evt and evt["ui_event"] == "form":
-        extra_data, valid = render_fields(evt["fields"])
+evt: Dict[str, Any] | None = st.session_state.get("event")
+if not evt:
+    st.stop()
 
-    submitted = st.form_submit_button("Submit")
+match evt["ui_event"]:
+    # ── dynamic form ────────────────────────────────────────────────
+    case "form":
+        with st.form("dynamic_form", clear_on_submit=True):
+            answers = render_fields(evt["fields"])
+            if st.form_submit_button("Submit"):
+                st.session_state.event = run_workflow(prompt, answers)
+                st.rerun()
 
-# ─────────────── handle Submit click(s) ───────────────────
-if submitted:
-    # 1st click – only prompt exists
-    if evt is None or evt["ui_event"] != "form":
-        state.event = run_workflow(state.prompt)
-        st.rerun()
+    # ── download link ──────────────────────────────────────────────
+    case "download_link":
+        st.success("Document ready:")
+        st.markdown(f"[Download]({evt['url']})")
 
-    # 2nd click – prompt + form data
-    elif valid:
-        state.event = run_workflow(state.prompt, extra_data)
-        st.rerun()
+    # ── plain text ────────────────────────────────────────────────
+    case "text":
+        st.write(evt.get("content", "(no content)"))
 
-# ─────────────────── final output ─────────────────────────
-evt = state.event
-if evt and evt["ui_event"] == "download_link":
-    st.markdown(f"[Download the document]({evt['url']})", unsafe_allow_html=True)
-    if st.button("🔄 Start over"):
-        state.clear()
-        st.rerun()
-
-elif evt and evt["ui_event"] == "text":
-    st.write(evt["content"])
-    if st.button("🔄 Start over"):
-        state.clear()
-        st.rerun()
+    case _:
+        st.error(f"Unsupported ui_event: {evt['ui_event']}")
+        st.json(evt)

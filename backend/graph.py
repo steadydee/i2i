@@ -1,136 +1,86 @@
 """
-backend/graph.py
-Phase-1 orchestrator using LangGraph’s StateGraph.
+LangGraph definition
+====================
+Intent  →  Gather  →  Process  →  Deliver
+The graph is UI-agnostic.  Front-ends call `run_workflow()` and just
+render the single `event` dict it returns.
 """
-
 from __future__ import annotations
-from typing import Any, TypedDict, Annotated
+from typing import Dict, Any, Optional
 
+from pydantic import BaseModel
 from langgraph.graph import StateGraph
-from langchain_core.runnables import Runnable
 
-from backend.db import sb
-from backend.processors import REG
-
-
-# ────────────────────────────── State schema ──────────────────────────────
-class WorkflowState(TypedDict, total=False):
-    user_input: str
-    form_data: dict
-    task: str
-    manifest: dict
-    user_inputs: dict
-    ask_form: bool
-    result: Any
-    response: dict
+from backend.intent import detect_intent
+from backend.tools.ui_gather import gather_fields
+from backend.processors import REG as PROC_REG
 
 
-# ───────────────────────────────── Nodes ──────────────────────────────────
-def intent_node(state: WorkflowState) -> WorkflowState:
-    text = state["user_input"].lower()
-    rows = (
-        sb().table("task_manifest")
-        .select("*")
-        .eq("enabled", True)
-        .execute()
-        .data
+# ─────────────────────────── State schema ────────────────────────────
+class WorkflowState(BaseModel):
+    prompt: str
+    manifest: Optional[Dict[str, Any]] = None
+    user_inputs: Optional[Dict[str, Any]] = None
+    event: Optional[Dict[str, Any]] = None      # ← single ui_event payload
+
+
+# ─────────────────────────── Node callables ───────────────────────────
+def intent_node(state: WorkflowState) -> Dict[str, Any]:
+    """Look up the manifest row that best matches the prompt."""
+    return {"manifest": detect_intent(state.prompt)}
+
+
+def process_node(state: WorkflowState) -> Dict[str, Any]:
+    """
+    If Gather already created an event (the form), skip processing.
+    Otherwise invoke the processor chain and store its ui_event.
+    """
+    if state.event:
+        return {}   # nothing to add
+
+    chain_id = state.manifest["processor_chain_id"]
+    chain = PROC_REG[chain_id]
+    ui_event = chain.invoke(
+        {"inputs": state.user_inputs,
+         "metadata": state.manifest.get("metadata"),
+         "prompt": state.prompt}
     )
-    for row in rows:
-        if any(p in text for p in row["phrase_examples"]):
-            state["task"] = row["task"]
-            state["manifest"] = row
-            return state
-
-    state["task"] = "unknown_task"
-    state["manifest"] = {}
-    return state
+    return {"event": ui_event}
 
 
-def gather_node(state: WorkflowState) -> WorkflowState:
-    if "form_data" in state:
-        state["user_inputs"] = {**state.get("user_inputs", {}), **state["form_data"]}
-        state.pop("form_data", None)
-
-    manifest = state.get("manifest", {})
-    required = {f["name"] for f in manifest.get("required_fields", [])}
-    have = set(state.get("user_inputs", {}))
-
-    state["ask_form"] = bool(required - have)
-    if state["ask_form"]:
-        state["response"] = {
-            "ui_event": "form",
-            "fields": manifest.get("required_fields", []),
-        }
-    return state
+def deliver_node(_: WorkflowState) -> Dict[str, Any]:
+    """No-op — final event already lives in the state."""
+    return {}
 
 
-def process_node(state: WorkflowState) -> WorkflowState:
-    if state.get("ask_form"):
-        return state
+# ─────────────────────────── Build the graph ─────────────────────────
+g = StateGraph(state_schema=WorkflowState)
 
-    chain_id = state["manifest"]["processor_chain_id"]
-    chain: Runnable = REG[chain_id]
+g.add_node("Intent",  intent_node)
+g.add_node("Gather",  gather_fields)
+g.add_node("Process", process_node)
+g.add_node("Deliver", deliver_node)
 
-    inputs = {
-        **state.get("user_inputs", {}),
-        "user_input": state["user_input"],
-        "metadata": state["manifest"].get("metadata", {}),
-    }
+g.add_edge("Intent",  "Gather")
+g.add_edge("Gather",  "Process")
+g.add_edge("Process", "Deliver")
 
-    state["result"] = chain.invoke(inputs)
-    return state
+g.set_entry_point("Intent")
+g.set_finish_point("Deliver")
 
-
-def deliver_node(state: WorkflowState) -> WorkflowState:
-    if "response" in state:
-        return state
-
-    result = state.get("result")
-
-    if isinstance(result, dict) and "url" in result:
-        state["response"] = {
-            "ui_event": "download_link",
-            "url": result["url"],
-        }
-    else:
-        state["response"] = {
-            "ui_event": "text",
-            "content": str(result),
-        }
-    return state
+graph = g.compile()
 
 
-# ────────────────────────── Build the StateGraph ──────────────────────────
-graph = StateGraph(WorkflowState)
-
-graph.add_node("Intent", intent_node)
-graph.add_node("Gather", gather_node)
-graph.add_node("Process", process_node)
-graph.add_node("Deliver", deliver_node)
-
-graph.set_entry_point("Intent")
-graph.add_edge("Intent", "Gather")
-
-# True → Process (need form), False → Deliver (ready)
-graph.add_conditional_edges(
-    "Gather",
-    Annotated[bool, "ask_form"],
-    {True: "Process", False: "Deliver"},
-)
-
-graph.add_edge("Process", "Deliver")
-
-graph = graph.compile()
-
-
-# ─────────────────────────── helper for Streamlit ─────────────────────────
-def run_workflow(user_text: str, form_data: dict | None = None) -> dict:
-    state: WorkflowState = {"user_input": user_text}
-    if form_data:
-        state["form_data"] = form_data
-
-    final = graph.invoke(state) or {}
-    return final.get(
-        "response",
-        {"ui_event": "text", "content": "⚠️ No response produced."},
-    )
+# ─────────────────────────── Public helper ───────────────────────────
+def run_workflow(
+    prompt: str,
+    extra_inputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    • 1st call with just the prompt → often returns a “form” event.
+    • 2nd call with same prompt + form answers → returns next event
+      (text, download_link, etc.).
+    """
+    init = WorkflowState(prompt=prompt, user_inputs=extra_inputs)
+    final_state = graph.invoke(init)
+    return final_state["event"]

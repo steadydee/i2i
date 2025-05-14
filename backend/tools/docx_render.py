@@ -1,61 +1,111 @@
 """
-backend.tools.docx_render
-Render a DOCX template stored in Supabase Storage and return a signed download URL.
+DocxRender — Supabase Storage helper
+===================================
 
-Buckets
--------
-templates   – contains your .docx templates  (object key = template_id + ".docx")
-documents   – output bucket for generated files
+• Downloads “templates/<template_id>.docx”
+• Replaces every {{merge_field}} (even when Word split it across runs)
+  in body text, tables, headers & footers.
+• Uploads result to “documents/<template_id>/<uuid>.docx”
+• Returns {"ui_event":"download_link", "url": …}
 
-Environment variables
----------------------
-SUPABASE_URL
-SUPABASE_SERVICE_ROLE_KEY      # access Storage via service role
-SUPABASE_DOC_BUCKET=documents  # optional override
-URL_EXPIRY_MIN=120             # signed URL lifetime
+Environment vars
+----------------
+SUPABASE_DOC_BUCKET   – output bucket name (default: documents)
+URL_EXPIRY_MIN        – signed-URL lifetime in minutes (default: 120)
 """
+from __future__ import annotations
 
-import io, os, uuid, docx
-from datetime import timedelta
-from langchain_core.runnables import Runnable
-from backend.db import sb  # your helper returns a supabase client
+import io, os, uuid
+from typing import Dict, Any
 
-class DocxRender(Runnable):
+import docx                              # pip install python-docx
+from backend.db import sb                # Supabase client
+
+TEMPLATE_BUCKET = "templates"
+OUTPUT_BUCKET   = os.getenv("SUPABASE_DOC_BUCKET", "documents")
+URL_EXPIRY_SEC  = int(os.getenv("URL_EXPIRY_MIN", "120")) * 60
+
+
+# ────────── storage helpers ───────────────────────────────────────────
+def _download(bucket: str, path: str) -> bytes:
+    """Handle storage3 DownloadFileResponse as well as raw bytes."""
+    obj = sb.storage.from_(bucket).download(path)
+    return obj.file if hasattr(obj, "file") else obj
+
+
+def _upload(bucket: str, key: str, blob: bytes) -> str:
+    store = sb.storage.from_(bucket)
+    store.upload(
+        key,
+        blob,
+        {
+            "content-type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        },
+    )
+    signed = store.create_signed_url(key, URL_EXPIRY_SEC)
+
+    if isinstance(signed, str):           # very old client
+        return signed
+    if isinstance(signed, dict):          # storage3 ≥0.6
+        return signed.get("signedURL") or signed.get("signed_url")
+    if hasattr(signed, "signed_url"):     # storage3 0.5
+        return signed.signed_url
+    raise RuntimeError("Unknown signed-URL response shape")
+
+
+# ────────── run-splitting safe replacement ───────────────────────────
+def _replace_in_runs(runs, mapping: Dict[str, Any]) -> None:
+    """
+    Merge all runs' text, replace {{field}} tokens, then push the
+    modified string back into the original run sequence.
+    """
+    full = "".join(r.text for r in runs)
+    replaced = full
+    for k, v in mapping.items():
+        replaced = replaced.replace(f"{{{{{k}}}}}", str(v))
+
+    if replaced == full:      # nothing changed
+        return
+
+    runs[0].text = replaced
+    for r in runs[1:]:
+        r.text = ""           # collapse extra runs
+
+
+# ────────── main class (LangChain Runnable-friendly) ─────────────────
+class DocxRender:
     def __init__(self, template_id: str):
-        self.template_id = template_id
-        self.tpl_bucket  = "templates"
-        self.out_bucket  = os.getenv("SUPABASE_DOC_BUCKET", "documents")
-        self.expiry_min  = int(os.getenv("URL_EXPIRY_MIN", "120"))
+        # allow caller to specify with / without .docx
+        self.template_id = template_id.rstrip(".docx")
 
-    # ── helpers ──────────────────────────────────────────────────────────
-    def _download_template(self) -> bytes:
-        path = f"{self.template_id}.docx"
-        resp = sb().storage.from_(self.tpl_bucket).download(path)
-        if not resp:
-            raise FileNotFoundError(f"Template {path} not found in bucket '{self.tpl_bucket}'")
-        return resp
+    # LangChain expects .invoke(input_dict) → output_dict
+    def invoke(self, inputs: Dict[str, Any], **_) -> Dict[str, Any]:
+        tpl_path = f"{self.template_id}.docx"
+        tpl_blob = _download(TEMPLATE_BUCKET, tpl_path)
 
-    def _upload_and_sign(self, buf: bytes) -> str:
+        doc = docx.Document(io.BytesIO(tpl_blob))
+
+        # replace in body paragraphs + headers & footers
+        parts = [doc] + [sect.header for sect in doc.sections] + \
+                [sect.footer for sect in doc.sections]
+        for part in parts:
+            for para in part.paragraphs:
+                _replace_in_runs(para.runs, inputs)
+
+        # replace inside tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        _replace_in_runs(para.runs, inputs)
+
+        # save to buffer
+        out = io.BytesIO()
+        doc.save(out)
+        out.seek(0)
+
         key = f"{self.template_id}/{uuid.uuid4()}.docx"
-        storage = sb().storage.from_(self.out_bucket)
-        storage.upload(key, buf, {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"})
-        signed = storage.create_signed_url(key, self.expiry_min * 60)
-        return signed["signedURL"]
+        url = _upload(OUTPUT_BUCKET, key, out.read())
 
-    # ── Runnable.invoke ──────────────────────────────────────────────────
-    def invoke(self, inputs: dict, **_) -> dict:
-        tpl_bytes = self._download_template()
-        doc = docx.Document(io.BytesIO(tpl_bytes))
-
-        # simple merge-field replacement {{field}}
-        for para in doc.paragraphs:
-            for run in para.runs:
-                for k, v in inputs.items():
-                    run.text = run.text.replace(f"{{{{{k}}}}}", str(v))
-
-        out_buf = io.BytesIO()
-        doc.save(out_buf)
-        out_buf.seek(0)
-
-        url = self._upload_and_sign(out_buf.read())
-        return {"url": url}
+        return {"ui_event": "download_link", "url": url}

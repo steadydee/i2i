@@ -1,22 +1,15 @@
-"""Shared Supabase client singleton."""
-from __future__ import annotations
-import os
-
 from dotenv import load_dotenv
-from supabase import create_client, Client   # pip install python-dotenv supabase
+load_dotenv()  # pulls vars from .env
 
-load_dotenv()                                # pulls SUPABASE_* from .env
+import os
+from supabase import create_client, Client
 
-_SB: Client | None = None
+_SUPA_URL = os.environ["SUPABASE_URL"]
+_SUPA_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or os.environ["SUPABASE_SERVICE_KEY"]         # matches your .env
+)
 
-
-def sb() -> Client:
-    """Return a cached Supabase client, creating it on first use."""
-    global _SB
-    if _SB is None:
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_KEY")
-        if not url or not key:
-            raise RuntimeError("Set SUPABASE_URL + SUPABASE_SERVICE_KEY in .env")
-        _SB = create_client(url, key)
-    return _SB
+supabase: Client = create_client(_SUPA_URL, _SUPA_KEY)
+sb = supabase  # legacy alias

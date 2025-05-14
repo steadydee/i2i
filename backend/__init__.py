@@ -1,7 +1,6 @@
-# backend/__init__.py
 """
-Package marker + explicit export of DocxRender so
-`backend.tools.docx_render.DocxRender` can be imported elsewhere.
+backend package
+(keep this file minimal to avoid circular-import headaches)
 """
-from backend.tools.docx_render import DocxRender  # noqa: F401
-from backend.tools.supabase_retriever import SupabaseRetriever  # noqa: F401
+# If you really need DocxRender elsewhere, import it where it’s used:
+#   from backend.tools.docx_render import DocxRender
