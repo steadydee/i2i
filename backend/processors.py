@@ -1,141 +1,92 @@
 """
 backend/processors.py
---------------------------------------------------
-• Validates every processor_chain row against ChainDef.
-• Accepts both "init_kwargs" (preferred) and legacy "params".
-• Interpolates placeholders in init_kwargs once at load time.
-• Registers the runnable in REG dict for fast lookup.
+Central registry (REG) of LangChain runnables used by graph.Process.
+
+* docx_tpl_render   – fills {{brace}} DOCX templates via docxtpl
+* policy_qna_chain  – stub HR Q&A (plain-text answer)
 """
 
 from __future__ import annotations
+from io import BytesIO
+from uuid import uuid4
+from typing import Dict
 
-import importlib
-import os
-import re
-from typing import Any, Dict
-
+from docxtpl import DocxTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_openai import ChatOpenAI
 
-from backend.db import sb
-from backend.chain_schema import ChainDef  # pydantic models
+from backend.db import sb   # existing Supabase client factory
 
-# public registry
+# ───────────────────────────── Global registry ────────────────────────────
 REG: Dict[str, Runnable] = {}
 
-# ── helpers ───────────────────────────────────────────────────────────────
-_placeholder_rx = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
+# -------------------------------------------------------------------------
+# 1. Brace-style DOCX renderer (plain function)
+# -------------------------------------------------------------------------
+def render_docx_braces(template_id: str, context: dict) -> dict:
+    """
+    1. Download a {{token}} template from 'templates' bucket
+    2. Render with docxtpl
+    3. Upload to 'documents' bucket
+    4. Return {'url': <signed link>} for download
+    """
+    client = sb()
 
-def _interp(val: str, ctx: dict[str, Any]) -> str:
-    """Replace {a.b} or {ENV_VAR} with values from ctx dict."""
-    def repl(m):
-        cur: Any = ctx
-        for key in m.group(1).split("."):
-            cur = cur.get(key, "")
-        return str(cur)
-    return _placeholder_rx.sub(repl, val)
+    # 1) template bytes
+    tpl_bytes = client.storage.from_("templates").download(template_id)
 
-def _resolve(path: str):
-    mod, name = path.rsplit(".", 1)
-    return getattr(importlib.import_module(mod), name)
+    # 2) merge
+    tpl = DocxTemplate(BytesIO(tpl_bytes))
+    tpl.render(context)               # {{token}} -> context["token"]
+    buf = BytesIO()
+    tpl.save(buf)
 
-# ── build one chain --------------------------------------------------------
-def _build_chain(def_json: dict) -> Runnable:
-    chain_def = ChainDef.parse_obj(def_json)   # raises on bad JSON
+    # 3) upload result
+    out_key = f"{template_id}/{uuid4()}.docx"
+    client.storage.from_("documents").upload(out_key, buf.getvalue())
 
-    chain: Runnable = RunnableLambda(lambda x: x)  # start with identity
-    for step in chain_def.steps:
-        cls = _resolve(step.class_path)
+    # 4) signed link (7-day expiry)
+    signed = client.storage.from_("documents").create_signed_url(
+        path=out_key,
+        expires_in=7 * 24 * 3600,
+    )["signedURL"]
+    return {"url": signed}
 
-        # kwargs with placeholder interpolation
-        ctx = {"env": os.environ}
-        init_kwargs = {
-            k: (_interp(v, ctx) if isinstance(v, str) else v)
-            for k, v in step.init_kwargs.items()
-        }
-
-        runnable: Runnable = cls(**init_kwargs)
-
-        # IMPORTANT: use .invoke so result passes through
-        chain = chain | RunnableLambda(lambda x, fn=runnable: fn.invoke(x))
-
-    return chain
-
-# ── load all rows at startup ----------------------------------------------
-def load_all() -> None:
-    rows = (
-        sb()
-        .table("processor_chains")
-        .select("chain_id, chain_json, enabled")
-        .execute()
-        .data
+# Wrap the plain function in a Runnable so Process can call `.invoke()`
+REG["docx_tpl_render"] = RunnableLambda(
+    lambda d: render_docx_braces(
+        template_id=d["metadata"]["template_id"],
+        context={k: v for k, v in d.items() if k not in ("metadata", "user_input")},
     )
-    for row in rows:
-        if not row.get("enabled", True):
-            continue
-        try:
-            REG[row["chain_id"]] = _build_chain(row["chain_json"])
-        except Exception as e:
-            # disable bad chains so runtime stays healthy
-            sb().table("processor_chains").update({"enabled": False}).eq("chain_id", row["chain_id"]).execute()
-            print(f"[processors] ⚠️ disabled broken chain {row['chain_id']}: {e}")
-
-load_all()
-# ───────────────── policy_qna_chain (temporary stub) ─────────────────
-#
-# This keeps the graph from crashing until we wire up the real RAG-based
-# policy lookup. It simply echoes the question back with a “TODO” note.
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.runnables import Runnable
-
-_policy_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are an HR assistant. "
-        "Respond briefly and flag that the full policy search is not yet implemented."
-    ),
-    ("human", "{question}")
-])
-
-policy_qna_chain: Runnable = _policy_prompt | ChatOpenAI(model_name="gpt-3.5-turbo")
-
-# register in the global registry
-REG["policy_qna_chain"] = policy_qna_chain
-# ───────────────── policy_qna_chain (temporary stub) ─────────────────
-#
-# Maps the graph’s {"user_input": "..."} into the prompt’s {"question": "..."}.
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.runnables import Runnable, RunnableLambda
-
-_policy_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are an HR assistant. "
-        "Respond briefly and flag that the full policy search is not yet implemented."
-    ),
-    ("human", "{question}")
-])
-
-# Map input → {"question": user_input}
-_input_mapper: Runnable = RunnableLambda(
-    lambda d: {"question": d["user_input"]}
 )
 
-policy_qna_chain: Runnable = _input_mapper | _policy_prompt | ChatOpenAI(model_name="gpt-3.5-turbo")
+# -------------------------------------------------------------------------
+# 2. Stub policy Q&A chain
+# -------------------------------------------------------------------------
+_policy_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an HR assistant. Respond briefly and note that the full "
+        "policy search feature is not yet implemented."
+    ),
+    ("human", "{question}")
+])
 
-REG["policy_qna_chain"] = policy_qna_chain
-from langchain_core.runnables import RunnableLambda
-
-# … existing _input_mapper | _policy_prompt | ChatOpenAI …
+# map input dict -> {"question": user_input}
+_input_map: Runnable = RunnableLambda(lambda d: {"question": d["user_input"]})
 
 policy_qna_chain: Runnable = (
-    _input_mapper
+    _input_map
     | _policy_prompt
     | ChatOpenAI(model_name="gpt-3.5-turbo")
-    | RunnableLambda(lambda m: m.content)   # ← NEW: return plain string
+    | RunnableLambda(lambda m: m.content)     # strip metadata; return plain str
 )
 
 REG["policy_qna_chain"] = policy_qna_chain
+
+# -------------------------------------------------------------------------
+# 3. (Optional) import & register any existing chains, e.g. doc_draft_chain
+# -------------------------------------------------------------------------
+# from backend.other_module import doc_draft_chain
+# REG["doc_draft_chain"] = doc_draft_chain
