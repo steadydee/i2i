@@ -1,50 +1,47 @@
 """
 backend/supabase.py
-Supabase helpers
 ────────────────────────────────────────────────────────
 • Loads SUPABASE_URL / SUPABASE_KEY from .env (python-dotenv).
-• Embeds the user prompt via the `/embed` Edge Function
-  using the anon key for authorization.
-• Calls `match_task_manifest_vec` with that vector and
-  returns the best task-manifest row.
+• Embeds a prompt via the `/embed` Edge Function.
+• Calls `match_task_manifest_vec` to fetch the best-matching task
+  manifest row for the current tenant.
 """
 
 from __future__ import annotations
 
-# auto-populate os.environ from .env  →  pip install python-dotenv
-from dotenv import load_dotenv
-load_dotenv()
-
-import os
 import json
-import requests
+import os
 from typing import Tuple, Dict, Any, List
-from supabase import create_client, Client
 
-# ─── configuration ───────────────────────────────────
-_SUPABASE_URL: str | None = os.getenv("SUPABASE_URL")
-_SUPABASE_KEY: str | None = os.getenv("SUPABASE_KEY")
+from dotenv import load_dotenv            # pip install python-dotenv
+from supabase import create_client, Client
+import requests
+
+# ── configuration ───────────────────────────────────────────────────────────
+load_dotenv()                             # populate os.environ
+
+_SUPABASE_URL = os.getenv("SUPABASE_URL")
+_SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not _SUPABASE_URL or not _SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_KEY missing from environment/.env")
+    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing in environment")
 
 _SB: Client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
 
-# Edge Function that returns { "embedding": [ … ] }
-_EMBED_URL = f"{_SUPABASE_URL}/functions/v1/embed"
+_EMBED_URL    = f"{_SUPABASE_URL}/functions/v1/embed"
+_HTTP_TIMEOUT = 10                        # seconds
 
-_HTTP_TIMEOUT = 10  # seconds
+TENANT_ID: str = os.getenv("TENANT_ID", "default")
+MIN_SIM:  float = 0.25                    # threshold (top score ≈ 0.283)
 
-
-# ─── helpers ──────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────────────────
 def _embed(text: str) -> List[float]:
-    """Call the Edge Function and return the 1536-dim vector."""
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {_SUPABASE_KEY}",   # anon key auth
-    }
+    """Return a 1 536-dim embedding for *text* via the Edge Function."""
     resp = requests.post(
         _EMBED_URL,
-        headers=headers,
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {_SUPABASE_KEY}",
+        },
         json={"text": text},
         timeout=_HTTP_TIMEOUT,
     )
@@ -54,16 +51,26 @@ def _embed(text: str) -> List[float]:
 
 def fetch_manifest(prompt: str) -> Tuple[str, Dict[str, Any]]:
     """
-    1. Embed the prompt via Edge Function.
-    2. Send the vector to match_task_manifest_vec().
-    3. Return (task, manifest_row_json).
+    Resolve *prompt* → (task_name, manifest_row).
+
+    1. Embed the prompt.
+    2. Ask `match_task_manifest_vec` for the single nearest task whose
+       similarity ≥ MIN_SIM for the current tenant.
     """
     vec = _embed(prompt)
 
-    # PostgREST expects the vector param as a JSON array string
-    res = _SB.rpc("match_task_manifest_vec", {"q_vec": json.dumps(vec)}).execute()
-    if not res.data:
-        raise RuntimeError("No manifest matched that prompt.")
+    res = _SB.rpc(
+        "match_task_manifest_vec",
+        {
+            "q_vec":          json.dumps(vec),   # pgvector via JSON-array text
+            "tenant":         TENANT_ID,
+            "k":              1,                 # top hit only
+            "min_similarity": MIN_SIM,
+        },
+    ).execute()
 
-    row: Dict[str, Any] = res.data
+    if not res.data:
+        raise RuntimeError("No task matched the prompt with sufficient similarity.")
+
+    row: Dict[str, Any] = res.data[0]
     return row["task"], row
