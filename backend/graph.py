@@ -1,120 +1,115 @@
 """
-backend.graph
-=============
-LangGraph definition (UI-agnostic)
-
-Intent  →  Gather  →  Process  →  Deliver
-
-Front-ends call `run_workflow(prompt, answers)` and simply render the
-single `event` dict it returns.
-
-Key tweak (May 14 ‘25)
-----------------------
-`run_workflow` now accepts either:
-
-    • answers dict               → {"client": "...", ...}
-    • full init_state dict       → {"user_inputs": {...}, "manifest": ...}
-
-so tests can pass flat answers without wrapping them in another layer.
+backend/graph.py
+LangGraph orchestration with hot-reload support.
 """
+
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import threading
+from typing import Dict, Any, Mapping
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Extra
 from langgraph.graph import StateGraph
-
-from backend.intent import detect_intent
-from backend.tools.ui_gather import gather_fields
-from backend.processors import REG as PROC_REG
+from langgraph.pregel import Pregel
+from langchain.schema.runnable import Runnable
 
 
-# ─────────────────────────── State schema ────────────────────────────
-class WorkflowState(BaseModel):
+# ──────────────────────────── 1 · Shared workflow state ────────────────────────────
+class WorkflowState(BaseModel, extra=Extra.allow):
     prompt: str
-    manifest: Optional[Dict[str, Any]] = None
-    user_inputs: Optional[Dict[str, Any]] = None
-    event: Optional[Dict[str, Any]] = None     # single ui_event payload
-
-    model_config = {"extra": "allow"}          # tolerate ad-hoc keys
+    answers: Dict[str, Any] | None = None
+    manifest: Dict[str, Any] | None = None
+    ui_event: Dict[str, Any] | None = None
 
 
-# ─────────────────────────── Node callables ──────────────────────────
-def intent_node(state: WorkflowState) -> Dict[str, Any]:
-    """Look up the manifest row that best matches the prompt."""
-    return {"manifest": detect_intent(state.prompt)}
+# ──────────────────────────── 2 · Nodes ────────────────────────────
+def intent_node(state: WorkflowState, *_: Any) -> WorkflowState:
+    """Look up the task manifest for the user’s prompt."""
+    from backend.supabase import fetch_manifest
+    _, manifest = fetch_manifest(state.prompt)
+    state.manifest = manifest or {
+        "processor_chain_id": "policy_qna_chain",
+        "required_fields": [],
+        "metadata": {},
+    }
+    return state
 
 
-def process_node(state: WorkflowState) -> Dict[str, Any]:
-    """Invoke the processor chain unless Gather already produced an event."""
-    if state.event:
-        return {}
+def gather_node(state: WorkflowState, *_: Any) -> WorkflowState:
+    required = state.manifest.get("required_fields", [])
+    if required and not state.answers:
+        state.ui_event = {"type": "form", "fields": required}
+    return state
+
+
+def process_node(state: WorkflowState, *_: Any) -> WorkflowState:
+    import backend.processors as processors
 
     chain_id = state.manifest["processor_chain_id"]
-    chain = PROC_REG[chain_id]
-    ui_event = chain.invoke(
-        {
-            "inputs": state.user_inputs,
-            "metadata": state.manifest.get("metadata"),
-            "prompt": state.prompt,
-        }
-    )
-    return {"event": ui_event}
+    try:
+        chain: Runnable = processors.REG[chain_id]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Chain '{chain_id}' not registered—did you reload the graph?"
+        ) from exc
+
+    payload: Mapping[str, Any] = {
+        "prompt": state.prompt,
+        "inputs": state.answers,
+        # pass only the nested metadata dict
+        "metadata": state.manifest.get("metadata", {}),
+    }
+    state.ui_event = chain.invoke(payload)
+    return state
 
 
-def deliver_node(_: WorkflowState) -> Dict[str, Any]:
-    """No-op – Deliver just surfaces `state.event`."""
-    return {}
+def deliver_node(state: WorkflowState, *_: Any) -> WorkflowState:
+    return state
 
 
-# ─────────────────────────── Build the graph ─────────────────────────
-_g = StateGraph(state_schema=WorkflowState)
-
-_g.add_node("Intent", intent_node)
-_g.add_node("Gather", gather_fields)
-_g.add_node("Process", process_node)
-_g.add_node("Deliver", deliver_node)
-
-_g.add_edge("Intent",  "Gather")
-_g.add_edge("Gather",  "Process")
-_g.add_edge("Process", "Deliver")
-
-_g.set_entry_point("Intent")
-_g.set_finish_point("Deliver")
-
-GRAPH = _g.compile()
+# ──────────────────────────── 3 · Graph builder & hot-reload ────────────────────────────
+_graph_lock = threading.RLock()
+_GRAPH: Pregel | None = None
 
 
-# ─────────────────────────── Public helper ───────────────────────────
-def run_workflow(
-    prompt: str,
-    extra_inputs: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Execute the LangGraph and return the *event* dict for the UI.
+def build_graph() -> Pregel:
+    with _graph_lock:
+        sg = StateGraph(WorkflowState)
 
-    Parameters
-    ----------
-    prompt :
-        User’s natural-language request.
-    extra_inputs :
-        Either:
-          • raw answers dict            {"client": "...", ...}
-          • full init_state dict        {"user_inputs": {...}, "manifest": ...}
+        sg.add_node("Intent", intent_node)
+        sg.add_node("Gather", gather_node)
+        sg.add_node("Process", process_node)
+        sg.add_node("Deliver", deliver_node)
 
-    Returns
-    -------
-    dict
-        The event payload produced by Deliver (form, download_link, text, …).
-    """
-    extra_inputs = extra_inputs or {}
+        sg.set_entry_point("Intent")
+        sg.add_edge("Intent", "Gather")
+        sg.add_conditional_edges(
+            "Gather",
+            lambda s: "Process" if s.ui_event is None else "Deliver",
+            {"Process": "Process", "Deliver": "Deliver"},
+        )
+        sg.add_edge("Process", "Deliver")
 
-    # Accept flat answers OR already-nested user_inputs
-    if "user_inputs" in extra_inputs:
-        init_kwargs = extra_inputs
-    else:
-        init_kwargs = {"user_inputs": extra_inputs}
+        return sg.compile()
 
-    init_state = WorkflowState(prompt=prompt, **init_kwargs)
-    final_state = GRAPH.invoke(init_state)
-    return final_state["event"]
+
+def reload_graph() -> None:
+    global _GRAPH
+    _GRAPH = build_graph()
+
+
+# build once at import
+reload_graph()
+
+
+# ──────────────────────────── 4 · Public helper ────────────────────────────
+def run_workflow(prompt: str, answers: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if _GRAPH is None:
+        raise RuntimeError("Graph not initialised – call reload_graph() first.")
+
+    init_state = WorkflowState(prompt=prompt, answers=answers)
+    result = _GRAPH.invoke(init_state)          # AddableValuesDict
+    return result.get("ui_event") or {
+        "type": "error",
+        "content": "No UI event produced",
+    }
