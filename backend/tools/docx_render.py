@@ -1,51 +1,61 @@
 """
-backend/tools/docx_render.py
-Fill a DOCX template using python-docx-template (`docxtpl`).
+backend.tools.docx_render
+Render a DOCX template stored in Supabase Storage and return a signed download URL.
+
+Buckets
+-------
+templates   – contains your .docx templates  (object key = template_id + ".docx")
+documents   – output bucket for generated files
+
+Environment variables
+---------------------
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY      # access Storage via service role
+SUPABASE_DOC_BUCKET=documents  # optional override
+URL_EXPIRY_MIN=120             # signed URL lifetime
 """
 
-from __future__ import annotations
-from pathlib import Path
-from typing import Any, Dict
+import io, os, uuid, docx
+from datetime import timedelta
+from langchain_core.runnables import Runnable
+from backend.db import sb  # your helper returns a supabase client
 
-from docxtpl import DocxTemplate
+class DocxRender(Runnable):
+    def __init__(self, template_id: str):
+        self.template_id = template_id
+        self.tpl_bucket  = "templates"
+        self.out_bucket  = os.getenv("SUPABASE_DOC_BUCKET", "documents")
+        self.expiry_min  = int(os.getenv("URL_EXPIRY_MIN", "120"))
 
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _download_template(self) -> bytes:
+        path = f"{self.template_id}.docx"
+        resp = sb().storage.from_(self.tpl_bucket).download(path)
+        if not resp:
+            raise FileNotFoundError(f"Template {path} not found in bucket '{self.tpl_bucket}'")
+        return resp
 
-class DocxRender:
-    """
-    Parameters
-    ----------
-    template_id : str | dict
-        Either "tpl_sow_v1" or a dict that contains it.
-    """
+    def _upload_and_sign(self, buf: bytes) -> str:
+        key = f"{self.template_id}/{uuid.uuid4()}.docx"
+        storage = sb().storage.from_(self.out_bucket)
+        storage.upload(key, buf, {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"})
+        signed = storage.create_signed_url(key, self.expiry_min * 60)
+        return signed["signedURL"]
 
-    def __init__(self, template_id: str | Dict[str, Any], **_: Any) -> None:
-        # Accept nested structures coming from the workflow state
-        if isinstance(template_id, dict):
-            template_id = (
-                template_id.get("template_id")
-                or (template_id.get("metadata") or {}).get("template_id")
-            )
+    # ── Runnable.invoke ──────────────────────────────────────────────────
+    def invoke(self, inputs: dict, **_) -> dict:
+        tpl_bytes = self._download_template()
+        doc = docx.Document(io.BytesIO(tpl_bytes))
 
-        if not isinstance(template_id, str) or not template_id:
-            raise ValueError("template_id must be a non-empty str")
+        # simple merge-field replacement {{field}}
+        for para in doc.paragraphs:
+            for run in para.runs:
+                for k, v in inputs.items():
+                    run.text = run.text.replace(f"{{{{{k}}}}}", str(v))
 
-        tpl_dir = Path(__file__).parent.parent / "templates"
-        self.template_path = tpl_dir / f"{template_id}.docx"
-        if not self.template_path.exists():
-            raise FileNotFoundError(
-                f"Template {self.template_path} not found. "
-                "Place the .docx in ./backend/templates."
-            )
+        out_buf = io.BytesIO()
+        doc.save(out_buf)
+        out_buf.seek(0)
 
-    def __call__(self, fields: Dict[str, Any]) -> str:
-        return self.run(fields)
-
-    def run(self, fields: Dict[str, Any]) -> str:
-        doc = DocxTemplate(str(self.template_path))
-        doc.render(fields)
-
-        client = fields.get("client", "output")
-        safe = "".join(c for c in str(client) if c.isalnum() or c in ("_", "-"))
-        out_path = Path("/tmp") / f"{safe}.docx"
-        doc.save(out_path)
-        return str(out_path)
+        url = self._upload_and_sign(out_buf.read())
+        return {"url": url}

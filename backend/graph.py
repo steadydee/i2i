@@ -1,98 +1,136 @@
-# -*- coding: utf-8 -*-
 """
-i2i LangGraph workflow
-──────────────────────────────────────────────────────────────────────────────
-User text  ─► Intent  ─► Gather (Supabase) ─► Process (processor_chain) ─► Deliver
+backend/graph.py
+Phase-1 orchestrator using LangGraph’s StateGraph.
 """
+
 from __future__ import annotations
-from typing import TypedDict, Any
+from typing import Any, TypedDict, Annotated
 
 from langgraph.graph import StateGraph
+from langchain_core.runnables import Runnable
 
-from backend.db import sb            # ← shared Supabase client
-from backend.processors import REG   # ← registry of LangChain runnables
+from backend.db import sb
+from backend.processors import REG
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# LangGraph state
-# ────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────── State schema ──────────────────────────────
 class WorkflowState(TypedDict, total=False):
-    user_input: str                # raw prompt from Streamlit
-    task: str                      # canonical task id (draft_sow / policy_qna)
-    gathered: dict                 # task-manifest row pulled in Gather
-    result: Any                    # output from processor chain
-    response: str                  # human-facing reply for the UI
+    user_input: str
+    form_data: dict
+    task: str
+    manifest: dict
+    user_inputs: dict
+    ask_form: bool
+    result: Any
+    response: dict
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Nodes
-# ────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────── Nodes ──────────────────────────────────
 def intent_node(state: WorkflowState) -> WorkflowState:
-    """Naïve keyword router; swap in classifier later."""
-    txt = state["user_input"].lower()
-    state["task"] = "draft_sow" if "sow" in txt else "policy_qna"
+    text = state["user_input"].lower()
+    rows = (
+        sb().table("task_manifest")
+        .select("*")
+        .eq("enabled", True)
+        .execute()
+        .data
+    )
+    for row in rows:
+        if any(p in text for p in row["phrase_examples"]):
+            state["task"] = row["task"]
+            state["manifest"] = row
+            return state
+
+    state["task"] = "unknown_task"
+    state["manifest"] = {}
     return state
 
 
 def gather_node(state: WorkflowState) -> WorkflowState:
-    """Fetch task-manifest row from Supabase."""
-    resp = (
-        sb()
-        .table("task_manifest")
-        .select("*")
-        .eq("task", state["task"])
-        .limit(1)
-        .execute()
-    )
-    row = resp.data[0] if resp.data else None
-    if row is None:
-        raise ValueError(f"No task_manifest row found for task='{state['task']}'")
-    state["gathered"] = row
+    if "form_data" in state:
+        state["user_inputs"] = {**state.get("user_inputs", {}), **state["form_data"]}
+        state.pop("form_data", None)
+
+    manifest = state.get("manifest", {})
+    required = {f["name"] for f in manifest.get("required_fields", [])}
+    have = set(state.get("user_inputs", {}))
+
+    state["ask_form"] = bool(required - have)
+    if state["ask_form"]:
+        state["response"] = {
+            "ui_event": "form",
+            "fields": manifest.get("required_fields", []),
+        }
     return state
 
 
 def process_node(state: WorkflowState) -> WorkflowState:
-    """Run the registered processor chain for this task."""
-    chain_id = state["gathered"]["processor_chain_id"]
-    chain = REG.get(chain_id)
-    if chain is None:
-        raise ValueError(f"No processor registered for '{chain_id}'")
+    if state.get("ask_form"):
+        return state
+
+    chain_id = state["manifest"]["processor_chain_id"]
+    chain: Runnable = REG[chain_id]
 
     inputs = {
+        **state.get("user_inputs", {}),
         "user_input": state["user_input"],
-        "metadata":   state["gathered"].get("metadata", {}),
+        "metadata": state["manifest"].get("metadata", {}),
     }
+
     state["result"] = chain.invoke(inputs)
     return state
 
 
 def deliver_node(state: WorkflowState) -> WorkflowState:
-    """Return whatever Process produced as a UI-friendly string."""
-    state["response"] = str(state.get("result", "(no result)"))
+    if "response" in state:
+        return state
+
+    result = state.get("result")
+
+    if isinstance(result, dict) and "url" in result:
+        state["response"] = {
+            "ui_event": "download_link",
+            "url": result["url"],
+        }
+    else:
+        state["response"] = {
+            "ui_event": "text",
+            "content": str(result),
+        }
     return state
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Build & compile the graph
-# ────────────────────────────────────────────────────────────────────────────
-builder = StateGraph(WorkflowState)
+# ────────────────────────── Build the StateGraph ──────────────────────────
+graph = StateGraph(WorkflowState)
 
-builder.add_node("Intent", intent_node)
-builder.add_node("Gather", gather_node)
-builder.add_node("Process", process_node)
-builder.add_node("Deliver", deliver_node)
+graph.add_node("Intent", intent_node)
+graph.add_node("Gather", gather_node)
+graph.add_node("Process", process_node)
+graph.add_node("Deliver", deliver_node)
 
-builder.set_entry_point("Intent")
-builder.add_edge("Intent", "Gather")
-builder.add_edge("Gather", "Process")
-builder.add_edge("Process", "Deliver")
-builder.set_finish_point("Deliver")
+graph.set_entry_point("Intent")
+graph.add_edge("Intent", "Gather")
 
-graph = builder.compile()
+# True → Process (need form), False → Deliver (ready)
+graph.add_conditional_edges(
+    "Gather",
+    Annotated[bool, "ask_form"],
+    {True: "Process", False: "Deliver"},
+)
+
+graph.add_edge("Process", "Deliver")
+
+graph = graph.compile()
 
 
-# Convenience helper for Streamlit
-def run_workflow(prompt: str) -> str:
-    """Run the entire graph and return the UI string."""
-    final_state = graph.invoke({"user_input": prompt})
-    return final_state["response"]
+# ─────────────────────────── helper for Streamlit ─────────────────────────
+def run_workflow(user_text: str, form_data: dict | None = None) -> dict:
+    state: WorkflowState = {"user_input": user_text}
+    if form_data:
+        state["form_data"] = form_data
+
+    final = graph.invoke(state) or {}
+    return final.get(
+        "response",
+        {"ui_event": "text", "content": "⚠️ No response produced."},
+    )

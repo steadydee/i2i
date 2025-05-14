@@ -1,101 +1,141 @@
 """
-Processor registry
-──────────────────────────────────────────────────────────────────────────────
-Loads rows from `processor_chains`, builds LangChain runnables, and wires the
-retriever step into RetrievalQA without passing duplicate arguments.
+backend/processors.py
+--------------------------------------------------
+• Validates every processor_chain row against ChainDef.
+• Accepts both "init_kwargs" (preferred) and legacy "params".
+• Interpolates placeholders in init_kwargs once at load time.
+• Registers the runnable in REG dict for fast lookup.
 """
+
 from __future__ import annotations
 
 import importlib
-import json
-from typing import Any, Callable, Dict, List
+import os
+import re
+from typing import Any, Dict
 
 from langchain_core.runnables import Runnable, RunnableLambda
-from backend.db import sb
 
+from backend.db import sb
+from backend.chain_schema import ChainDef  # pydantic models
+
+# public registry
 REG: Dict[str, Runnable] = {}
 
+# ── helpers ───────────────────────────────────────────────────────────────
+_placeholder_rx = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 
-# --------------------------------------------------------------------------- #
-# Helpers                                                                     #
-# --------------------------------------------------------------------------- #
-def _resolve_class(path: str):
-    module_path, _, attr = path.rpartition(".")
-    module = importlib.import_module(module_path)
-    return getattr(module, attr)
+def _interp(val: str, ctx: dict[str, Any]) -> str:
+    """Replace {a.b} or {ENV_VAR} with values from ctx dict."""
+    def repl(m):
+        cur: Any = ctx
+        for key in m.group(1).split("."):
+            cur = cur.get(key, "")
+        return str(cur)
+    return _placeholder_rx.sub(repl, val)
 
+def _resolve(path: str):
+    mod, name = path.rsplit(".", 1)
+    return getattr(importlib.import_module(mod), name)
 
-def _build_general(cls, init_kwargs: dict[str, Any]) -> Runnable:
-    if isinstance(cls, type) and issubclass(cls, Runnable):
-        obj: Runnable | Callable = cls(**init_kwargs)
-    else:
-        obj = cls
-    if not isinstance(obj, Runnable):
-        obj = RunnableLambda(lambda x, _fn=obj: _fn(x))
-    return obj
+# ── build one chain --------------------------------------------------------
+def _build_chain(def_json: dict) -> Runnable:
+    chain_def = ChainDef.parse_obj(def_json)   # raises on bad JSON
 
+    chain: Runnable = RunnableLambda(lambda x: x)  # start with identity
+    for step in chain_def.steps:
+        cls = _resolve(step.class_path)
 
-def _compose(runnables: List[Runnable]) -> Runnable:
-    chain: Runnable = runnables[0]
-    for nxt in runnables[1:]:
-        chain = chain | nxt
+        # kwargs with placeholder interpolation
+        ctx = {"env": os.environ}
+        init_kwargs = {
+            k: (_interp(v, ctx) if isinstance(v, str) else v)
+            for k, v in step.init_kwargs.items()
+        }
+
+        runnable: Runnable = cls(**init_kwargs)
+
+        # IMPORTANT: use .invoke so result passes through
+        chain = chain | RunnableLambda(lambda x, fn=runnable: fn.invoke(x))
+
     return chain
 
-
-# --------------------------------------------------------------------------- #
-# Chain builder                                                               #
-# --------------------------------------------------------------------------- #
-def _build_chain(spec: dict | str) -> Runnable:
-    data = json.loads(spec) if isinstance(spec, str) else spec
-    steps_def = [s for s in data["steps"] if "class_path" in s]
-
-    runnables: List[Runnable] = []
-    for step in steps_def:
-        path = step["class_path"]
-        cls = _resolve_class(path)
-        init_kwargs = dict(step.get("init_kwargs", {}))
-        method = step.get("method")
-        m_kwargs = step.get("method_kwargs", {})
-
-        # ---- RetrievalQA wiring ------------------------------------------- #
-        if path.endswith(".RetrievalQA"):
-            from langchain_openai import ChatOpenAI
-
-            if not runnables:
-                raise ValueError("RetrievalQA cannot be the first step")
-
-            retriever = runnables[-1]
-            if init_kwargs.get("retriever") == "{{retrieve}}":  # *** patched line
-                init_kwargs.pop("retriever")                    # remove duplicate
-
-            llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
-            runnable = cls.from_chain_type(llm=llm, retriever=retriever, **init_kwargs)
-        else:
-            runnable = _build_general(cls, init_kwargs)
-            if method:
-                runnable = getattr(runnable, method)(**m_kwargs)  # type: ignore
-
-        runnables.append(runnable)
-
-    if not runnables:
-        raise ValueError("No runnable steps built")
-
-    return _compose(runnables)
-
-
-# --------------------------------------------------------------------------- #
-# Registry loader                                                             #
-# --------------------------------------------------------------------------- #
+# ── load all rows at startup ----------------------------------------------
 def load_all() -> None:
     rows = (
         sb()
         .table("processor_chains")
-        .select("chain_id,chain_json")
+        .select("chain_id, chain_json, enabled")
         .execute()
         .data
     )
     for row in rows:
-        REG[row["chain_id"]] = _build_chain(row["chain_json"])
-
+        if not row.get("enabled", True):
+            continue
+        try:
+            REG[row["chain_id"]] = _build_chain(row["chain_json"])
+        except Exception as e:
+            # disable bad chains so runtime stays healthy
+            sb().table("processor_chains").update({"enabled": False}).eq("chain_id", row["chain_id"]).execute()
+            print(f"[processors] ⚠️ disabled broken chain {row['chain_id']}: {e}")
 
 load_all()
+# ───────────────── policy_qna_chain (temporary stub) ─────────────────
+#
+# This keeps the graph from crashing until we wire up the real RAG-based
+# policy lookup. It simply echoes the question back with a “TODO” note.
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
+
+_policy_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an HR assistant. "
+        "Respond briefly and flag that the full policy search is not yet implemented."
+    ),
+    ("human", "{question}")
+])
+
+policy_qna_chain: Runnable = _policy_prompt | ChatOpenAI(model_name="gpt-3.5-turbo")
+
+# register in the global registry
+REG["policy_qna_chain"] = policy_qna_chain
+# ───────────────── policy_qna_chain (temporary stub) ─────────────────
+#
+# Maps the graph’s {"user_input": "..."} into the prompt’s {"question": "..."}.
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable, RunnableLambda
+
+_policy_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an HR assistant. "
+        "Respond briefly and flag that the full policy search is not yet implemented."
+    ),
+    ("human", "{question}")
+])
+
+# Map input → {"question": user_input}
+_input_mapper: Runnable = RunnableLambda(
+    lambda d: {"question": d["user_input"]}
+)
+
+policy_qna_chain: Runnable = _input_mapper | _policy_prompt | ChatOpenAI(model_name="gpt-3.5-turbo")
+
+REG["policy_qna_chain"] = policy_qna_chain
+from langchain_core.runnables import RunnableLambda
+
+# … existing _input_mapper | _policy_prompt | ChatOpenAI …
+
+policy_qna_chain: Runnable = (
+    _input_mapper
+    | _policy_prompt
+    | ChatOpenAI(model_name="gpt-3.5-turbo")
+    | RunnableLambda(lambda m: m.content)   # ← NEW: return plain string
+)
+
+REG["policy_qna_chain"] = policy_qna_chain
