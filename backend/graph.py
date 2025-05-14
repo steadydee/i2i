@@ -1,12 +1,25 @@
 """
-LangGraph definition
-====================
+backend.graph
+=============
+LangGraph definition (UI-agnostic)
+
 Intent  →  Gather  →  Process  →  Deliver
-The graph is UI-agnostic.  Front-ends call `run_workflow()` and just
-render the single `event` dict it returns.
+
+Front-ends call `run_workflow(prompt, answers)` and simply render the
+single `event` dict it returns.
+
+Key tweak (May 14 ‘25)
+----------------------
+`run_workflow` now accepts either:
+
+    • answers dict               → {"client": "...", ...}
+    • full init_state dict       → {"user_inputs": {...}, "manifest": ...}
+
+so tests can pass flat answers without wrapping them in another layer.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional
+
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 from langgraph.graph import StateGraph
@@ -21,54 +34,55 @@ class WorkflowState(BaseModel):
     prompt: str
     manifest: Optional[Dict[str, Any]] = None
     user_inputs: Optional[Dict[str, Any]] = None
-    event: Optional[Dict[str, Any]] = None      # ← single ui_event payload
+    event: Optional[Dict[str, Any]] = None     # single ui_event payload
+
+    model_config = {"extra": "allow"}          # tolerate ad-hoc keys
 
 
-# ─────────────────────────── Node callables ───────────────────────────
+# ─────────────────────────── Node callables ──────────────────────────
 def intent_node(state: WorkflowState) -> Dict[str, Any]:
     """Look up the manifest row that best matches the prompt."""
     return {"manifest": detect_intent(state.prompt)}
 
 
 def process_node(state: WorkflowState) -> Dict[str, Any]:
-    """
-    If Gather already created an event (the form), skip processing.
-    Otherwise invoke the processor chain and store its ui_event.
-    """
+    """Invoke the processor chain unless Gather already produced an event."""
     if state.event:
-        return {}   # nothing to add
+        return {}
 
     chain_id = state.manifest["processor_chain_id"]
     chain = PROC_REG[chain_id]
     ui_event = chain.invoke(
-        {"inputs": state.user_inputs,
-         "metadata": state.manifest.get("metadata"),
-         "prompt": state.prompt}
+        {
+            "inputs": state.user_inputs,
+            "metadata": state.manifest.get("metadata"),
+            "prompt": state.prompt,
+        }
     )
     return {"event": ui_event}
 
 
 def deliver_node(_: WorkflowState) -> Dict[str, Any]:
-    """No-op — final event already lives in the state."""
+    """No-op – Deliver just surfaces `state.event`."""
     return {}
 
 
 # ─────────────────────────── Build the graph ─────────────────────────
-g = StateGraph(state_schema=WorkflowState)
+_g = StateGraph(state_schema=WorkflowState)
 
-g.add_node("Intent",  intent_node)
-g.add_node("Gather",  gather_fields)
-g.add_node("Process", process_node)
-g.add_node("Deliver", deliver_node)
+_g.add_node("Intent", intent_node)
+_g.add_node("Gather", gather_fields)
+_g.add_node("Process", process_node)
+_g.add_node("Deliver", deliver_node)
 
-g.add_edge("Intent",  "Gather")
-g.add_edge("Gather",  "Process")
-g.add_edge("Process", "Deliver")
+_g.add_edge("Intent",  "Gather")
+_g.add_edge("Gather",  "Process")
+_g.add_edge("Process", "Deliver")
 
-g.set_entry_point("Intent")
-g.set_finish_point("Deliver")
+_g.set_entry_point("Intent")
+_g.set_finish_point("Deliver")
 
-graph = g.compile()
+GRAPH = _g.compile()
 
 
 # ─────────────────────────── Public helper ───────────────────────────
@@ -77,10 +91,30 @@ def run_workflow(
     extra_inputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    • 1st call with just the prompt → often returns a “form” event.
-    • 2nd call with same prompt + form answers → returns next event
-      (text, download_link, etc.).
+    Execute the LangGraph and return the *event* dict for the UI.
+
+    Parameters
+    ----------
+    prompt :
+        User’s natural-language request.
+    extra_inputs :
+        Either:
+          • raw answers dict            {"client": "...", ...}
+          • full init_state dict        {"user_inputs": {...}, "manifest": ...}
+
+    Returns
+    -------
+    dict
+        The event payload produced by Deliver (form, download_link, text, …).
     """
-    init = WorkflowState(prompt=prompt, user_inputs=extra_inputs)
-    final_state = graph.invoke(init)
+    extra_inputs = extra_inputs or {}
+
+    # Accept flat answers OR already-nested user_inputs
+    if "user_inputs" in extra_inputs:
+        init_kwargs = extra_inputs
+    else:
+        init_kwargs = {"user_inputs": extra_inputs}
+
+    init_state = WorkflowState(prompt=prompt, **init_kwargs)
+    final_state = GRAPH.invoke(init_state)
     return final_state["event"]
