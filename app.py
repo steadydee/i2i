@@ -49,6 +49,28 @@ def render_dashboard():
 
     # TODO: Recent tasks, Task library, etc.
 
+    # ───── Render Last Event (Result) ─────
+    event = st.session_state.get('event')
+    if event:
+        ui_event = event.get("ui_event")
+        if ui_event == "text":
+            st.write(event.get("content", ""))
+            preview = event.get("preview")
+            if preview:
+                with st.expander("Show Source Chunks"):
+                    for i, chunk in enumerate(preview, 1):
+                        st.markdown(f"**Chunk {i}:** {chunk.get('brief', '')}")
+                        with st.expander("Show full text"):
+                            st.code(chunk.get("content", ""))
+        elif ui_event == "download_link":
+            url = event.get("url")
+            if url:
+                st.markdown(f"[Download SOW]({url})")
+            else:
+                st.write("No download link available.")
+        else:
+            st.write(event)
+
 # ───── Wizard View (Steps 1 & 2) ─────
 def render_wizard():
     st.title("Workflow Wizard")

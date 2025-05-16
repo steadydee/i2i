@@ -10,15 +10,9 @@ Expected kwargs (gathered from the form):
 """
 from backend.tools.docx_render import DocxRender
 
-# Template ID stored once here; change when you upload a new version
-_TEMPLATE_ID = "tpl_sow_v1"
+_TEMPLATE_ID = "sow_v1"  # Must match Supabase template name, no prefix
 
 _renderer = DocxRender(template_id=_TEMPLATE_ID)
 
-
 def generate(**fields):
-    """
-    Forward all user-supplied fields to DocxRender and return
-    its standard `{"ui_event": "download_link", "url": ...}` dict.
-    """
     return _renderer.invoke(fields)

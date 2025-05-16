@@ -1,89 +1,68 @@
 """
-backend/supabase.py
-────────────────────────────────────────────────────────
-• Embeds a prompt via the `/embed` Edge Function.
-• Calls `match_task_manifest_vec` to find the best task.
-• Pulls the full manifest row so downstream code has all fields.
+backend.supabase
+----------------
+Supabase DB and embedding helpers.
+
+Exposes:
+- _SB: sync supabase client
+- _embed: embedding function (calls edge function)
+- fetch_manifest: finds best task manifest for an input prompt
 """
-
-from __future__ import annotations
-
-import json
-import os
-from typing import Tuple, Dict, Any, List
-
 from dotenv import load_dotenv
-from supabase import create_client, Client
-import requests
-
-# ── config ──────────────────────────────────────────────────────────────────
 load_dotenv()
 
-_SB_URL  = os.getenv("SUPABASE_URL")
-_SB_KEY  = os.getenv("SUPABASE_KEY")
-if not _SB_URL or not _SB_KEY:
-    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY missing")
+import os
+import requests
+from supabase import create_client, Client
+from typing import Any, Dict, Tuple
 
+_SB_URL = os.environ.get("SUPABASE_URL")
+_SB_KEY = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
 _SB: Client = create_client(_SB_URL, _SB_KEY)
 
-_EMBED_URL    = f"{_SB_URL}/functions/v1/embed"
-_HTTP_TIMEOUT = 10
+def _embed(text: str) -> list:
+    """
+    Calls the /embed edge function for text embedding.
+    """
+    base_url = os.environ.get("SUPABASE_URL")
+    if not base_url:
+        raise RuntimeError("SUPABASE_URL environment variable not set.")
+    embed_url = f"{base_url}/functions/v1/embed"
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable not set.")
 
-TENANT_ID = os.getenv("TENANT_ID", "default")
-MIN_SIM   = 0.25          # chosen from last test (top score ≈ 0.28)
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-def _embed(text: str) -> List[float]:
     resp = requests.post(
-        _EMBED_URL,
+        embed_url,
         headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {_SB_KEY}",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('SUPABASE_KEY') or os.environ.get('SUPABASE_SERVICE_KEY') or os.environ.get('SUPABASE_ANON_KEY')}",
+            "x-openai-key": openai_api_key
         },
-        json={"text": text},
-        timeout=_HTTP_TIMEOUT,
+        json={"text": text}
     )
     resp.raise_for_status()
     return resp.json()["embedding"]
 
-
-def fetch_manifest(prompt: str) -> Tuple[str, Dict[str, Any]]:
-    """Return (task_name, full manifest row) for a user prompt."""
+def fetch_manifest(prompt: str, min_similarity: float = 0.30, tenant: str = "default") -> Tuple[str, Dict[str, Any]]:
+    """
+    Embeds the input prompt and finds the closest matching task manifest row
+    by calling the 'match_task_manifest_vec' RPC. Returns (task_id, manifest dict).
+    Aborts if cosine distance is above the min_similarity threshold.
+    """
     vec = _embed(prompt)
+    rpc_result = _SB.rpc(
+        "match_task_manifest_vec",
+        {
+            "q_vec": vec,
+            "tenant": tenant,
+            "min_similarity": min_similarity
+        }
+    ).execute()
 
-    # 1. vector search → gives task + distance
-    hit = (
-        _SB.rpc(
-            "match_task_manifest_vec",
-            {
-                "q_vec":          json.dumps(vec),
-                "tenant":         TENANT_ID,
-                "k":              1,
-                "min_similarity": MIN_SIM,
-            },
-        )
-        .execute()
-        .data
-    )
+    if not rpc_result.data or not rpc_result.data[0]:
+        return "", {}
 
-    if not hit:
-        raise RuntimeError("No task matched the prompt with sufficient similarity.")
-
-    task_name: str = hit[0]["task"]
-    distance:  float = hit[0]["dist"]
-
-    # 2. pull the full manifest row expected by the workflow
-    manifest = (
-        _SB.table("task_manifest")
-           .select("*")
-           .eq("task", task_name)
-           .single()
-           .execute()
-           .data
-    )
-
-    if not manifest:
-        raise RuntimeError(f"Manifest row for task={task_name!r} disappeared.")
-
-    manifest["dist"] = distance          # keep similarity handy
-    return task_name, manifest
+    row = rpc_result.data[0]
+    task_id = row.get("task_id") or row.get("id") or row.get("task") or ""
+    return task_id, row
