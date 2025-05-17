@@ -1,81 +1,113 @@
-"""
-backend.vector_search
-────────────────────────────────────────────────────────
-Similarity-search helper that hides Supabase quirks.
-
-• For the standard `vector_chunks` table we call the JSON wrapper
-  `search_vector_chunks` (avoids “materialize mode required”).
-• For any other table we fall back to the generic `match_vectors`.
-"""
-
+#!/usr/bin/env python3
+# ──────────────────────────────────────────────────────────────────────────────
+#  Vector-search utilities (Supabase + pgvector)
+# ──────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import json
-from typing import List
+import os
+from typing import Any, Dict, List
 
-from langchain_core.documents import Document
+import openai
+from supabase import create_client, Client
 
-from backend.supabase import _SB, _embed
+# --------------------------------------------------------------------------- #
+# 1.  Config & helpers
+# --------------------------------------------------------------------------- #
+openai.api_key = os.environ["OPENAI_API_KEY"]
+_MODEL_EMBED   = "text-embedding-3-small"          # ⇢ same model stored in DB
+
+_SB: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"],
+)
 
 
-class SupaRetriever:
+def _embed(text: str) -> List[float]:
+    """One-liner wrapper for OpenAI’s embedding endpoint."""
+    return openai.embeddings.create(
+        model=_MODEL_EMBED,
+        input=text,
+    ).data[0].embedding
+
+
+# Make the embedder usable elsewhere
+embed_text = _embed
+
+
+# --------------------------------------------------------------------------- #
+# 2.  Generic pgvector RPC wrapper
+# --------------------------------------------------------------------------- #
+def match_vectors(
+    *,
+    table_name: str,
+    q_text: str,
+    k: int = 10,
+    tenant: str = "default",
+    doc_id: str | None = None,
+) -> List[Dict[str, Any]]:
     """
-    Parameters
-    ----------
-    table_name : str   Table that stores (embedding, content, metadata)
-    k          : int   Number of chunks to return
-    tenant     : str   Tenant filter
-    doc_id     : str   Optional doc-ID filter
+    Call the `match_vectors` Postgres function and return
+    a list of rows + raw cosine **similarity** (higher = closer).
     """
+    q_vec = _embed(q_text)
 
-    def __init__(
-        self,
-        table_name: str = "vector_chunks",
-        *,
-        k: int = 4,
-        tenant: str = "default",
-        doc_id: str | None = None,
-    ) -> None:
-        self.table_name = table_name
-        self.k = k
-        self.tenant = tenant
-        self.doc_id = doc_id
+    params: Dict[str, Any] = {
+        "table_name": table_name,
+        "q_vec":      q_vec,
+        "k":          k,
+        "tenant":     tenant,
+        "doc_id":     doc_id,
+    }
 
-    # ------------------------------------------------------------------ #
-    # LangChain-style interface
-    # ------------------------------------------------------------------ #
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        q_vec = json.dumps(_embed(query))
+    rows = _SB.rpc("match_vectors", params).execute().data or []
 
-        if self.table_name == "vector_chunks":
-            fn_name = "search_vector_chunks"
-            params = {
-                "q_vec": q_vec,
-                "k": self.k,
-                "tenant": self.tenant,
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        payload = r["payload"]          # original row as JSONB
+        sim     = float(r["score"])     # cosine similarity (-1 … +1)
+        out.append(payload | {"sim": sim})
+
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 3.  Bulk task-embedding fetch (used by router)
+# --------------------------------------------------------------------------- #
+def get_task_embeddings() -> List[Dict[str, Any]]:
+    """Return enabled tasks with their stored embeddings."""
+    rows = (
+        _SB.table("task_manifest")
+           .select("task, embedding, metadata")
+           .eq("enabled", True)
+           .execute()
+           .data
+    )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["embedding"] is None:
+            continue
+
+        meta = r.get("metadata") or {}
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+
+        out.append(
+            {
+                "task":      r["task"],
+                "helper_py": meta.get("helper_py", "default_helper"),
+                "embedding": r["embedding"],
             }
-            if self.doc_id is not None:
-                params["p_doc_id"] = self.doc_id
-        else:
-            fn_name = "match_vectors"
-            params = {
-                "table_name": self.table_name,
-                "q_vec": q_vec,
-                "k": self.k,
-                "tenant": self.tenant,
-                "doc_id": self.doc_id,
-            }
+        )
+    return out
 
-        rows = _SB.rpc(fn_name, params).execute().data
 
-        docs: List[Document] = []
-        for r in rows:
-            raw_meta = r.get("metadata") or {}
-            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
-            if "dist" in r:
-                meta["dist"] = r["dist"]
-            if "doc_id" in r:
-                meta["doc_id"] = r["doc_id"]
-            docs.append(Document(page_content=r["content"], metadata=meta))
-
-        return docs
+# --------------------------------------------------------------------------- #
+# 4.  Public exports
+# --------------------------------------------------------------------------- #
+__all__ = [
+    "embed_text",
+    "match_vectors",
+    "get_task_embeddings",
+]

@@ -1,99 +1,113 @@
 import streamlit as st
-from backend.graph import run_workflow
 from backend.wizard import (
     wizard_find_similar,
     wizard_start_plan_chat,
+    wizard_chat_continue,
 )
 
-# ── session-helpers ─────────────────────────────────────────────────────────
-def _ss(key, default=None):
-    return st.session_state.get(key, default)
+st.set_page_config(page_title="i2i Assistant", page_icon="🧠", layout="wide")
+ss = st.session_state
 
-def _go_home():
-    st.session_state["mode"] = "home"          # Streamlit auto-reruns
+# ---------------- simple router ----------------
+def go(page: str) -> None:
+    ss.page = page
+if "page" not in ss:
+    ss.page = "dashboard"
 
-def _go_wizard():
-    st.session_state.update(mode="wizard", wizard_step="describe")
-
-# ────────────────────────────────────────────────────────────────────────────
-# 0.  DASHBOARD  vs  WIZARD router
-# ────────────────────────────────────────────────────────────────────────────
-if _ss("mode") != "wizard":
-    # ------------- HOME DASHBOARD ------------------------------------------
+# ------------------------------------------------------------------ #
+# DASHBOARD                                                          #
+# ------------------------------------------------------------------ #
+if ss.page == "dashboard":
     st.title("🧠 i2i Assistant")
 
-    query = st.text_input("Describe the task")
-    if st.button("Run", disabled=not query.strip()):
-        st.write(run_workflow(query))   # placeholder
+    with st.form("search"):
+        q = st.text_input("Describe the task")
+        if st.form_submit_button("Run") and q.strip():
+            st.write("Running existing task …")         # placeholder
 
-    st.divider()
-    st.button("🪄  Create New Workflow (Wizard)", on_click=_go_wizard)
-    st.stop()
+    st.button("Create New Workflow (Wizard)",
+              on_click=lambda: go("wizard_intro"))
 
-# ======================== WIZARD ===========================================
-step = _ss("wizard_step", "describe")
+# ------------------------------------------------------------------ #
+# WIZARD · splash (choose task vs workflow)                          #
+# ------------------------------------------------------------------ #
+if ss.page == "wizard_intro":
+    st.header("✨ Workflow Wizard – welcome")
+    st.button("Create a Task", on_click=lambda: go("wizard_goal"))
+    st.button("Create a Workflow (soon)", disabled=True)
+    st.button("← Dashboard", on_click=lambda: go("dashboard"))
 
-# ── step: describe goal ----------------------------------------------------
-if step == "describe":
+# ------------------------------------------------------------------ #
+# WIZARD · step 1 – describe goal                                    #
+# ------------------------------------------------------------------ #
+if ss.page == "wizard_goal":
     st.header("🧙 What would you like to do?")
+
     goal = st.text_area(
-        "Describe the task in 2–3 sentences, including inputs, processing, and expected output."
+        "Describe the task in 2 – 3 sentences, including inputs, processing, and expected output.",
+        key="wiz_goal_input",
+        height=130,
     )
+
     if st.button("Next", disabled=not goal.strip()):
-        sims = wizard_find_similar(goal.strip())
-        st.session_state["wizard_goal"] = goal.strip()
-        if sims:
-            st.session_state.update(wizard_step="similar", wizard_similar=sims)
-        else:
-            st.session_state.update(
-                wizard_step="chat_plan",
-                wizard_chat=wizard_start_plan_chat(goal.strip()),
-            )
-        st.rerun()                         # rerun needed here
+        ss.wiz_goal = goal.strip()
+        ss.sim_tasks = wizard_find_similar(ss.wiz_goal)
+        go("wizard_similar")
+        st.rerun()                       # single rerun after nav
 
-    st.button("← Dashboard", on_click=_go_home)
-    st.stop()
+    st.button("← Back", on_click=lambda: go("wizard_intro"))
+    st.button("← Dashboard", on_click=lambda: go("dashboard"))
 
-# ── step: similar tasks ----------------------------------------------------
-if step == "similar":
+# ------------------------------------------------------------------ #
+# WIZARD · similar-tasks hit-list                                    #
+# ------------------------------------------------------------------ #
+if ss.page == "wizard_similar":
     st.header("🧙 Similar tasks found")
-    for row in _ss("wizard_similar", []):
-        st.subheader(row.get("title") or row["task"])
-        st.caption(", ".join(row.get("phrase_examples", [])))
 
-        col_run, col_ignore = st.columns(2)
-        if col_run.button("Run this task", key=f"run_{row['task']}"):
-            st.success("🚀 (Integration placeholder)")
+    if not ss.sim_tasks:
+        st.info("No close matches – let’s design a new task.")
+        if st.button("Continue"):
+            go("wizard_plan")
+            st.rerun()
+    else:
+        for t in ss.sim_tasks:
+            st.subheader(t["task"])
+            st.caption(", ".join(t["phrase_examples"]))
+            col1, col2 = st.columns(2)
+            col1.button("Run this task", key=f"run_{t['task']}")
+            col2.button("Ignore", key=f"ign_{t['task']}")
 
-        if col_ignore.button("Ignore", key=f"ign_{row['task']}"):
-            st.session_state.update(
-                wizard_step="chat_plan",
-                wizard_chat=wizard_start_plan_chat(_ss("wizard_goal")),
-            )
-            st.rerun()                     # rerun after state change
+    st.button("← Back", on_click=lambda: go("wizard_goal"))
+    st.button("← Dashboard", on_click=lambda: go("dashboard"))
 
-    st.button("← Dashboard", on_click=_go_home)
-    st.stop()
+# ------------------------------------------------------------------ #
+# WIZARD · planning chat with GPT                                    #
+# ------------------------------------------------------------------ #
+if ss.page == "wizard_plan":
+    if "wizard_chat" not in ss:
+        ss.wizard_chat = wizard_start_plan_chat(ss.wiz_goal)
 
-# ── step: chat-planner intro ----------------------------------------------
-if step == "chat_plan":
     st.header("🧙 Preparing to build your task")
 
-    chat = _ss("wizard_chat", [])
-    for turn in chat:
-        with st.chat_message(turn["role"]):
-            st.markdown(turn["content"])
+    # history (skip system prompt)
+    for msg in ss.wizard_chat[1:]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-    reply = st.text_input("Your reply (type “yes” or corrections)…")
-    if st.button("Continue", disabled=not reply.strip()):
-        chat.append({"role": "user", "content": reply.strip()})
-        st.session_state["wizard_chat"] = chat
-        st.success("✅ Reply captured (multi-turn loop coming soon)")
+    user_msg = st.chat_input("Type your reply…")
+    if user_msg:
+        ss.wizard_chat.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.write(user_msg)
 
-    col_back, col_dash = st.columns(2)
-    if col_back.button("← Back"):
-        st.session_state["wizard_step"] = "describe"
-        st.rerun()
-    if col_dash.button("← Dashboard", on_click=_go_home):
-        pass
-    st.stop()
+        with st.spinner("Thinking…"):
+            assistant_text = wizard_chat_continue(ss.wizard_chat)
+        ss.wizard_chat.append({"role": "assistant", "content": assistant_text})
+
+        with st.chat_message("assistant"):
+            st.write(assistant_text)
+
+        st.rerun()                      # refresh for next turn
+
+    st.button("← Back", on_click=lambda: go("wizard_goal"))
+    st.button("← Dashboard", on_click=lambda: go("dashboard"))
