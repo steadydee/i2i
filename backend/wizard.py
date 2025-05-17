@@ -1,131 +1,162 @@
 """
-Helpers for the 3-step Workflow Wizard (minimal but working).
-
-* wizard_create_draft()      – Step 1: upload template, extract {{fields}}, insert draft
-* wizard_update_fields.*     – Step 2: load / render / save field list
-* wizard_publish()           – Step 3: draft → processor_chains + task_manifest
-
-Designed to unblock dev quickly; you can harden parsing, validation,
-and governance metadata later.
+Wizard helpers
+──────────────
+  • wizard_find_similar   – vector / keyword search for existing tasks
+  • wizard_start_plan_chat – first assistant turn (“Is that correct?”)
+  • wizard_create_draft / wizard_update_fields / wizard_publish
 """
 
 from __future__ import annotations
 
-import json
-import re
-import uuid
+import json, re, uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Any, Tuple
 
-import streamlit as st
-
+from openai import OpenAI                      # ← new 1.x client
 from backend.supabase import _SB
+from backend.graph      import run_workflow
 
-BUCKET = "templates"
-TENANT_DEFAULT = "default"
+# ── config ────────────────────────────────────────────────────────────────
+EMB_MODEL        = "text-embedding-3-small"
+_SIM_THRESHOLD   = 0.50          # vector cut-off (was 0.60)
 
-# ── low-level helpers ---------------------------------------------------------
+TENANT           = "default"
+BUCKET           = "templates"
+
+_OA = OpenAI()                   # single shared client
 
 
-def _upload_template(file) -> str:
-    """Save uploaded file to Supabase Storage and row in `templates`."""
-    data = file.getvalue()  # read bytes once
-    ext = Path(file.name).suffix.lower().lstrip(".")
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ 1.  FIND SIMILAR TASKS (vector + keyword)                            ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+def _embed(text: str) -> List[float]:
+    return _OA.embeddings.create(model=EMB_MODEL, input=text).data[0].embedding
+
+
+def wizard_find_similar(
+    description: str,
+    *,
+    top_k: int = 5,
+    threshold: float | None = None,
+) -> List[dict]:
+    """Return ≤ top_k tasks whose cosine-sim ≥ threshold."""
+    th = _SIM_THRESHOLD if threshold is None else threshold
+    try:
+        q_vec = _embed(description)
+        res = _SB.rpc(
+            "wizard_task_lookup",
+            {"query_embedding": q_vec, "top_k": top_k},
+        ).execute()
+
+        seen, ranked = set(), []
+        for item in res.data or []:
+            if float(item["score"]) < th:
+                continue
+            row = item["task_row"]
+            if row["task"] not in seen:
+                ranked.append(row)
+                seen.add(row["task"])
+        return ranked
+
+    except Exception:
+        # fall back to legacy keyword router
+        hit = run_workflow(description)
+        return [hit] if hit.get("ui_event") != "wizard_offer" else []
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ 2.  START PLAN-CHAT                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+_CHAT_SYS = (
+    "You are the Workflow Wizard planner. Restate the user's goal in one short "
+    "paragraph: mention inputs, processing, and output. End with 'Is that correct?'"
+)
+
+def wizard_start_plan_chat(goal: str) -> List[dict]:
+    resp = _OA.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": _CHAT_SYS},
+            {"role": "user",   "content": goal},
+        ],
+        temperature=0.3,
+    )
+    first = resp.choices[0].message.content.strip()
+    return [{"role": "assistant", "content": first}]
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ 3.  DRAFT CRUD                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+def _upload_template(file) -> Tuple[str, bytes]:
+    raw = file.getvalue()
+    ext = file.name.split(".")[-1].lower()
     template_id = uuid.uuid4().hex
-    path = f"{TENANT_DEFAULT}/{template_id}.{ext}"
+    path = f"{TENANT}/{template_id}.{ext}"
 
-    _SB.storage.from_(BUCKET).upload(path, data, {"content-type": file.type})
+    _SB.storage.from_(BUCKET).upload(path, raw, {"content-type": file.type})
     _SB.table("templates").insert(
-        {
-            "template_id": template_id,
-            "tenant_id": TENANT_DEFAULT,
-            "path": path,
-            "filename": file.name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        dict(template_id=template_id,
+             filename=file.name,
+             bucket_path=path,
+             tenant_id=TENANT),
     ).execute()
-    return template_id, data
+    return template_id, raw
 
 
 def _extract_placeholders(raw: bytes) -> List[str]:
-    """Very naive {{placeholder}} extractor (good for txt/md/html)."""
-    text = raw.decode("utf-8", errors="ignore")
-    return re.findall(r"{{\\s*([a-zA-Z0-9_]+)\\s*}}", text)
+    return re.findall(r"{{\s*([a-zA-Z0-9_]+)\s*}}", raw.decode(errors="ignore"))
 
 
-def _field_spec(name: str) -> Dict[str, Any]:
+def _field(name: str) -> Dict[str, Any]:
     return {
-        "name": name,
-        "label": name.replace("_", " ").title(),
+        "name":   name,
+        "label":  name.replace("_", " ").title(),
         "widget": "text_input",
     }
 
 
-# ── Step 1 – create draft ------------------------------------------------------
+def wizard_create_draft(goal: str, template_file) -> Tuple[bool, str]:
+    if not goal.strip():
+        return False, "Goal required"
 
-
-def wizard_create_draft(
-    goal: str, template_file, tenant: str
-) -> Tuple[bool, str]:
-    """Returns (True, draft_id) on success; (False, err) on failure."""
-    goal = goal.strip()
-    if not goal:
-        return False, "Goal is required."
-
-    template_id = None
-    required_fields: List[Dict[str, Any]] = []
-
+    template_id, fields = None, []
     if template_file:
         template_id, raw = _upload_template(template_file)
-        required_fields = [_field_spec(n) for n in _extract_placeholders(raw)]
+        fields = [_field(f) for f in _extract_placeholders(raw)]
 
-    draft_id = str(uuid.uuid4())
+    draft_id = uuid.uuid4().hex
     _SB.table("wizard_drafts").insert(
-        {
-            "draft_id": draft_id,
-            "tenant_id": tenant,
-            "goal": goal,
-            "template_id": template_id,
-            "required_fields": json.dumps(required_fields),
-            "step": 1,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        dict(
+            draft_id=draft_id,
+            tenant_id=TENANT,
+            goal=goal.strip(),
+            template_id=template_id,
+            required_fields=json.dumps(fields),
+            step=1,
+        )
     ).execute()
-
     return True, draft_id
 
 
-# ── Step 2 – field editor ------------------------------------------------------
+class wizard_update_fields:
+    """Tiny namespace with load / save helpers."""
 
-
-class _FieldEditor:
-    """Namespace so app can call wizard_update_fields.load/render/save."""
-
-    # --- load draft row --------------------------------------------------------
     @staticmethod
     def load(draft_id: str):
-        res = (
+        row = (
             _SB.table("wizard_drafts")
-            .select("draft_id, required_fields, template_id, goal")
+            .select("*")
             .eq("draft_id", draft_id)
             .single()
             .execute()
             .data
         )
-        if not res:
+        if not row:
             return None
-        res["required_fields"] = json.loads(res["required_fields"])
-        return type("Draft", (), res)  # simple obj with attrs
+        row["required_fields"] = json.loads(row["required_fields"] or "[]")
+        return type("Draft", (), row)
 
-    # --- render grid (very simple placeholder) --------------------------------
-    @staticmethod
-    def render_edit_grid(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        st.caption("Field list (editing UI coming soon):")
-        st.code(json.dumps(fields, indent=2), language="json")
-        return fields  # unchanged for now
-
-    # --- save back -------------------------------------------------------------
     @staticmethod
     def save(draft_id: str, fields: List[Dict[str, Any]]):
         _SB.table("wizard_drafts").update(
@@ -133,22 +164,12 @@ class _FieldEditor:
         ).eq("draft_id", draft_id).execute()
 
 
-wizard_update_fields = _FieldEditor  # re-export
-
-
-# ── Step 3 – publish -----------------------------------------------------------
-
-
 def wizard_publish(draft) -> Tuple[bool, str]:
-    """
-    Turn *draft* (object from load) into live task.
-    Returns (True, task_id) or (False, error_msg).
-    """
+    """Insert processor_chains + task_manifest rows, mark draft published."""
     try:
         chain_id = f"doc_chain_{uuid.uuid4().hex[:6]}"
-        task_id = f"task_{uuid.uuid4().hex[:4]}"
+        task_id  = f"draft_{uuid.uuid4().hex[:4]}"
 
-        # Minimal runnable chain (single node that merges template + fields)
         chain_json = {
             "type": "json_graph",
             "version": "1.0",
@@ -164,44 +185,35 @@ def wizard_publish(draft) -> Tuple[bool, str]:
             },
         }
 
-        # Insert processor_chains row
         _SB.table("processor_chains").insert(
-            {
-                "chain_id": chain_id,
-                "tenant_id": TENANT_DEFAULT,
-                "chain_json": json.dumps(chain_json),
-                "enabled": True,
-                "version": "1.0",
-            }
+            dict(chain_id=chain_id,
+                 tenant_id=TENANT,
+                 chain_json=json.dumps(chain_json),
+                 enabled=True)
         ).execute()
 
-        # Insert task_manifest row
         _SB.table("task_manifest").insert(
-            {
-                "task": task_id,
-                "tenant_id": TENANT_DEFAULT,
-                "title": draft.goal[:60],
-                "phrase_examples": json.dumps([draft.goal]),
-                "required_fields": json.dumps(draft.required_fields),
-                "processor_chain_id": chain_id,
-                "output_type": "download_link",
-                "enabled": True,
-            }
+            dict(task=task_id,
+                 tenant_id=TENANT,
+                 phrase_examples=json.dumps([draft.goal]),
+                 required_fields=json.dumps(draft.required_fields),
+                 processor_chain_id=chain_id,
+                 output_type="download_link",
+                 enabled=True)
         ).execute()
 
-        # Mark draft as published
         _SB.table("wizard_drafts").update(
             {"published_at": datetime.now(timezone.utc).isoformat()}
         ).eq("draft_id", draft.draft_id).execute()
 
         return True, task_id
-    except Exception as e:  # pragma: no cover
-        return False, str(e)
+    except Exception as e:
+        return False, f"publish error: {e}"
 
-
-# ── public re-exports ----------------------------------------------------------
 
 __all__ = [
+    "wizard_find_similar",
+    "wizard_start_plan_chat",
     "wizard_create_draft",
     "wizard_update_fields",
     "wizard_publish",
