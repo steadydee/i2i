@@ -18,7 +18,6 @@ class WorkflowState(BaseModel, extra=Extra.allow):
 
 def intent_node(state: WorkflowState, *_: Any) -> WorkflowState:
     from backend.supabase import fetch_manifest
-
     _, manifest = fetch_manifest(state.prompt)
     state.manifest = manifest or {
         "processor_chain_id": "policy_qna_chain",
@@ -84,7 +83,7 @@ def build_graph() -> Pregel:
 def reload_graph() -> None:
     global _GRAPH
     with _graph_lock:
-        _GRAPH = build_graph()      # no recursive call back into processors
+        _GRAPH = build_graph()      # no recursive call into processors
 
 
 reload_graph()      # build once at import
@@ -95,8 +94,9 @@ def run_workflow(prompt: str, answers: Dict[str, Any] | None = None) -> Dict[str
         raise RuntimeError("Graph not initialised – call reload_graph() first")
 
     init_state = WorkflowState(prompt=prompt, answers=answers)
-    final_state: WorkflowState = _GRAPH.invoke(init_state)  # type: ignore
+    result_dict = _GRAPH.invoke(init_state)        # AddableValuesDict
 
-    if not final_state.event:
+    event = result_dict.get("event")
+    if not event:
         return {"ui_event": "error", "content": "No event produced"}
-    return final_state.event
+    return event
