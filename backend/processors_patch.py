@@ -1,4 +1,4 @@
-# --- drop-in replacement for the helper inside backend/processors.py ---------
+from backend.intent# --- drop-in replacement for the helper inside backend/processors.py ---------
 from __future__ import annotations
 from textwrap import shorten
 from typing import Dict, List
