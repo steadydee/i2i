@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
-import streamlit as st
+from typing import Dict, List
 
+import streamlit as st
 from backend.graph   import run_workflow
 from backend.wizard  import wizard_step_1
 
-# ───── logger ────────────────────────────────────────────────────────────
+# ───── logger ──────────────────────────────────────────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "DEBUG"),
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -22,16 +23,52 @@ log = logging.getLogger("i2i.app")
 
 st.set_page_config(page_title="🧠  i2i Assistant", layout="centered")
 
-# ───── helpers ───────────────────────────────────────────────────────────
+# ───── helpers ─────────────────────────────────────────────────────────
 def set_view(view: str) -> None:
     log.debug("🔀 view -> %s", view)
     st.session_state["view"] = view
 
-# ───── session defaults ─────────────────────────────────────────────────
+
+def dynamic_form(fields: List[Dict]) -> None:
+    """
+    Generic form renderer. When submitted:
+    • stores answers in st.session_state["answers"]
+    • immediately re-runs workflow with those answers
+    """
+    answers: Dict = {}
+    with st.form("dyn_form"):
+        for f in fields:
+            name   = f["name"]
+            label  = f.get("label", name)
+            widget = f.get("widget", "text_input")
+            key    = f"f_{name}"
+
+            if widget == "text_input":
+                answers[name] = st.text_input(label, key=key)
+            elif widget == "number_input":
+                answers[name] = st.number_input(label, key=key)
+            # add more widgets as needed
+
+        submitted = st.form_submit_button("Submit")
+
+    if submitted:
+        # cache answers
+        st.session_state["answers"] = answers
+        log.debug("Collected answers: %s", answers)
+
+        # re-invoke workflow with answers
+        prompt  = st.session_state.get("prompt", "")
+        result  = run_workflow(prompt, answers)
+        st.session_state["event"] = result
+
+        st.rerun()
+
+
+# ───── session defaults ────────────────────────────────────────────────
 st.session_state.setdefault("view",        "dashboard")
 st.session_state.setdefault("wizard_step", 1)
 
-# ───── dashboard view ───────────────────────────────────────────────────
+# ───── dashboard view ─────────────────────────────────────────────────
 def render_dashboard() -> None:
     st.title("🧠  i2i Assistant")
     st.caption("Describe a task or launch the workflow wizard.")
@@ -45,7 +82,7 @@ def render_dashboard() -> None:
         st.session_state["prompt"] = prompt
 
         log.debug("➡️  run_workflow(%s)", prompt)
-        result = run_workflow(prompt)
+        result = run_workflow(prompt, st.session_state.get("answers", {}))
         log.debug("⬅️  run_workflow result: %s", result)
 
         if not result or result.get("ui_event") == "not_found":
@@ -55,31 +92,38 @@ def render_dashboard() -> None:
                 set_view("wizard")
             st.stop()
 
-        st.session_state["event"] = result
+        # cache result & clear answers for next run
+        st.session_state["event"]   = result
+        st.session_state.pop("answers", None)
         st.rerun()
 
     st.button("Create New Workflow (Wizard)", on_click=lambda: set_view("wizard"))
 
-    # show last event
+    # ─── render last event ────────────────────────────────────────────
     event = st.session_state.get("event")
     if not event:
         return
 
-    output   = event.get("output", event)      # fallback for legacy shape
+    output   = event.get("output", event)
     ui_event = output.get("ui_event")
     log.debug("🎨 render ui_event=%s", ui_event)
 
     if ui_event == "text":
         st.markdown(output.get("content", ""))
+
     elif ui_event == "download_link":
         url = output.get("url")
         st.markdown(f"[Download document]({url})" if url else "*No download link returned*")
+
     elif ui_event == "form":
-        st.error("Form event reached dashboard unexpectedly.")
+        st.subheader("Fill out the required fields")
+        dynamic_form(output.get("fields", []))
+
     else:
         st.json(event)
 
-# ───── wizard view (unchanged) ───────────────────────────────────────────
+
+# ───── wizard view (unchanged from before) ─────────────────────────────
 def render_wizard() -> None:
     st.title("Workflow Wizard")
     step = st.session_state.get("wizard_step", 1)
@@ -112,17 +156,17 @@ def render_wizard() -> None:
             for idx, t in enumerate(wiz_evt.get("suggested_templates", [])):
                 if st.button(f"Use “{t['label']}”", key=f"tpl_{idx}"):
                     log.debug("✔ template picked: %s", t)
-                    st.session_state["wizard_selection"] = {"type":"template","value":t}
+                    st.session_state["wizard_selection"] = {"type": "template", "value": t}
                     st.session_state["wizard_step"] = 2
                     st.rerun()
                 st.write(f"- **{t['label']}** — {t['description']}")
 
-            # llm-plan
+            # llm plan
             llm_plan = wiz_evt.get("llm_plan")
             if llm_plan:
                 if st.button("Use LLM-recommended plan", key="llm_btn"):
-                    log.debug("✔ llm-plan picked")
-                    st.session_state["wizard_selection"] = {"type":"llm_plan","value":llm_plan}
+                    log.debug("✔ llm plan picked")
+                    st.session_state["wizard_selection"] = {"type": "llm_plan", "value": llm_plan}
                     st.session_state["wizard_step"] = 2
                     st.rerun()
                 for i, step_desc in enumerate(llm_plan, 1):
@@ -141,16 +185,17 @@ def render_wizard() -> None:
         st.error("Unknown wizard step!")
         log.error("wizard at unexpected step=%s", step)
 
-# ───── router ────────────────────────────────────────────────────────────
-view = st.session_state["view"]
-log.debug("📟 current view: %s", view)
 
-if view == "dashboard":
+# ───── router ───────────────────────────────────────────────────────────
+current_view = st.session_state["view"]
+log.debug("📟 current view: %s", current_view)
+
+if current_view == "dashboard":
     render_dashboard()
-elif view == "wizard":
+elif current_view == "wizard":
     render_wizard()
 else:
-    st.error(f"Unknown view “{view}”")
-    log.error("session in unknown view=%s", view)
+    st.error(f"Unknown view “{current_view}”")
+    log.error("session in unknown view=%s", current_view)
 
-st.caption(f"v0.1 · TENANT: {os.getenv('TENANT_ID','default')}")
+st.caption(f"v0.1 · TENANT: {os.getenv('TENANT_ID', 'default')}")
