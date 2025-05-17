@@ -1,201 +1,189 @@
 #!/usr/bin/env python3
-"""
-i2i App: Dynamic Dashboard + Workflow Wizard
-• Thin, data-driven UI
-• DEBUG logging around every external call & state change
-"""
 from __future__ import annotations
-
-import logging
-import os
-from typing import Dict, List
-
+import os, re, logging, traceback
 import streamlit as st
-from backend.graph   import run_workflow
-from backend.wizard  import wizard_step_1
 
-# ───── logger ──────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "DEBUG"),
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-)
+from backend.graph      import run_workflow, reload_graph
+from backend.wizard     import wizard_step_1, wizard_step_2
+from backend.templates  import upload_template, extract_placeholders
+from backend.drafts     import create_draft, update_fields
+from backend.publish    import publish_draft
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)-8s %(message)s")
 log = logging.getLogger("i2i.app")
 
-st.set_page_config(page_title="🧠  i2i Assistant", layout="centered")
+st.set_page_config(page_title="🧠 i2i Assistant", layout="centered")
 
-# ───── helpers ─────────────────────────────────────────────────────────
-def set_view(view: str) -> None:
-    log.debug("🔀 view -> %s", view)
-    st.session_state["view"] = view
-
-
-def dynamic_form(fields: List[Dict]) -> None:
-    """
-    Generic form renderer. When submitted:
-    • stores answers in st.session_state["answers"]
-    • immediately re-runs workflow with those answers
-    """
-    answers: Dict = {}
-    with st.form("dyn_form"):
-        for f in fields:
-            name   = f["name"]
-            label  = f.get("label", name)
-            widget = f.get("widget", "text_input")
-            key    = f"f_{name}"
-
-            if widget == "text_input":
-                answers[name] = st.text_input(label, key=key)
-            elif widget == "number_input":
-                answers[name] = st.number_input(label, key=key)
-            # add more widgets as needed
-
-        submitted = st.form_submit_button("Submit")
-
-    if submitted:
-        # cache answers
-        st.session_state["answers"] = answers
-        log.debug("Collected answers: %s", answers)
-
-        # re-invoke workflow with answers
-        prompt  = st.session_state.get("prompt", "")
-        result  = run_workflow(prompt, answers)
-        st.session_state["event"] = result
-
-        st.rerun()
-
-
-# ───── session defaults ────────────────────────────────────────────────
-st.session_state.setdefault("view",        "dashboard")
+# ── session defaults ────────────────────────────────────────────────────
+st.session_state.setdefault("view", "dashboard")
 st.session_state.setdefault("wizard_step", 1)
 
-# ───── dashboard view ─────────────────────────────────────────────────
-def render_dashboard() -> None:
-    st.title("🧠  i2i Assistant")
-    st.caption("Describe a task or launch the workflow wizard.")
+# ── helpers ─────────────────────────────────────────────────────────────
+def start_new_wizard():
+    st.session_state.update(view="wizard", wizard_step=1)
+    for k in ("wizard_event","wiz_sel","field_defs","node_params","draft_id"):
+        st.session_state.pop(k, None)
 
-    with st.form("prompt_form"):
-        prompt    = st.text_input("Describe the task", value=st.session_state.get("prompt", ""))
-        submitted = st.form_submit_button("Run")
-
-    if submitted and prompt.strip():
-        prompt = prompt.strip()
-        st.session_state["prompt"] = prompt
-
-        log.debug("➡️  run_workflow(%s)", prompt)
-        result = run_workflow(prompt, st.session_state.get("answers", {}))
-        log.debug("⬅️  run_workflow result: %s", result)
-
-        if not result or result.get("ui_event") == "not_found":
-            st.warning("No matching task found.")
-            if st.button("Create as Workflow (Wizard)", key="wizard_btn"):
-                st.session_state["wizard_goal"] = prompt
-                set_view("wizard")
-            st.stop()
-
-        # cache result & clear answers for next run
-        st.session_state["event"]   = result
-        st.session_state.pop("answers", None)
-        st.rerun()
-
-    st.button("Create New Workflow (Wizard)", on_click=lambda: set_view("wizard"))
-
-    # ─── render last event ────────────────────────────────────────────
-    event = st.session_state.get("event")
-    if not event:
-        return
-
-    output   = event.get("output", event)
-    ui_event = output.get("ui_event")
-    log.debug("🎨 render ui_event=%s", ui_event)
-
-    if ui_event == "text":
-        st.markdown(output.get("content", ""))
-
-    elif ui_event == "download_link":
-        url = output.get("url")
-        st.markdown(f"[Download document]({url})" if url else "*No download link returned*")
-
-    elif ui_event == "form":
-        st.subheader("Fill out the required fields")
-        dynamic_form(output.get("fields", []))
-
-    else:
-        st.json(event)
-
-
-# ───── wizard view (unchanged from before) ─────────────────────────────
-def render_wizard() -> None:
-    st.title("Workflow Wizard")
-    step = st.session_state.get("wizard_step", 1)
-    log.debug("🧙 wizard step=%s", step)
-
-    if step == 1:
-        st.caption("Step 1 · Describe your goal")
-
-        with st.form("wizard_goal_form"):
-            goal      = st.text_input("Goal", value=st.session_state.get("wizard_goal", ""))
-            submitted = st.form_submit_button("Next")
-
-        if submitted and goal.strip():
-            goal = goal.strip()
-            st.session_state["wizard_goal"] = goal
-
-            log.debug("➡️  wizard_step_1(%s)", goal)
-            wiz_evt = wizard_step_1(goal)
-            log.debug("⬅️  wizard_step_1 result: %s", wiz_evt)
-
-            st.session_state["wizard_event"]     = wiz_evt
-            st.session_state["wizard_selection"] = None
+def dynamic_form(fields:list[dict]) -> None:
+    with st.form("dynamic_form"):
+        answers={}
+        for f in fields:
+            k=f"{f['name']}_input"
+            widget=f.get("widget","text_input")
+            if widget=="number_input":
+                answers[f["name"]] = st.number_input(f["label"], key=k)
+            elif widget=="select":
+                answers[f["name"]] = st.selectbox(f["label"], ["web","api"], key=k)
+            else:
+                answers[f["name"]] = st.text_input(f["label"], key=k)
+        if st.form_submit_button("Submit"):
+            st.session_state["event"] = run_workflow(
+                st.session_state.get("prompt",""), answers)
             st.rerun()
 
-        wiz_evt = st.session_state.get("wizard_event")
-        if wiz_evt and wiz_evt.get("step") == 1:
+def render_field_builder(fields:list[dict]) -> list[dict]:
+    edited=[]
+    for i,f in enumerate(fields):
+        c = st.columns(4)
+        f["name"]   = c[0].text_input("name", f["name"], key=f"n{i}")
+        f["label"]  = c[1].text_input("label", f["label"], key=f"l{i}")
+        f["widget"] = c[2].selectbox(
+            "widget", ["text_input","number_input","date_input","select"],
+            index=["text_input","number_input","date_input","select"].index(f["widget"]),
+            key=f"w{i}"
+        )
+        if c[3].button("❌", key=f"del{i}"):
+            continue
+        edited.append(f)
+    if st.button("Add field"):
+        edited.append({"name":"","label":"","widget":"text_input"})
+    return edited
+
+# ── dashboard view ──────────────────────────────────────────────────────
+def render_dashboard():
+    st.title("🧠  i2i Assistant")
+    with st.form("prompt_form"):
+        prompt = st.text_input("Describe the task", st.session_state.get("prompt",""))
+        if st.form_submit_button("Run") and prompt.strip():
+            st.session_state["prompt"] = prompt.strip()
+            st.session_state["event"]  = run_workflow(prompt.strip())
+            st.rerun()
+
+    st.button("Create New Workflow (Wizard)", on_click=start_new_wizard)
+
+    evt = st.session_state.get("event")
+    if not evt:
+        return
+    out = evt.get("output", evt)
+    if out["ui_event"] == "text":
+        st.markdown(out["content"])
+    elif out["ui_event"] == "download_link":
+        st.markdown(f"[Download]({out.get('url')})")
+    elif out["ui_event"] == "form":
+        dynamic_form(out["fields"])
+    else:
+        st.json(out)
+
+# ── wizard view ─────────────────────────────────────────────────────────
+def render_wizard():
+    step = st.session_state.get("wizard_step", 1)
+
+    # Step 1 – goal / template
+    if step == 1:
+        st.header("Wizard · Step 1 – goal / template")
+        goal = st.text_input("Goal", st.session_state.get("wizard_goal",""))
+        if st.button("Next") and goal.strip():
+            st.session_state.update(
+                wizard_goal  = goal.strip(),
+                wizard_event = wizard_step_1(goal.strip())
+            ); st.rerun()
+
+        uploaded = st.file_uploader("Upload template",
+                                    type=["docx","pptx","html","txt","md"])
+        if uploaded:
+            tenant = os.getenv("TENANT_ID","default")
+            data   = uploaded.read()
+            tid    = upload_template(data, uploaded.name, tenant)
+            names  = extract_placeholders(data, os.path.splitext(uploaded.name)[1].lower())
+
+            def gw(n:str)->str:
+                if re.search(r"(amount|total|cost|price)", n): return "number_input"
+                if re.search(r"(date|due|deadline)", n):       return "date_input"
+                return "text_input"
+
+            fields = [{"name":n,"label":n.replace('_',' ').title(),"widget":gw(n)} for n in names]
+            did = create_draft(goal or "Template task", tenant, tid, fields)
+
+            st.session_state.update(
+                draft_id   = did,
+                wiz_sel    = {"type":"template","value":{"template_id":tid}},
+                field_defs = fields,
+                wizard_step=2
+            )
+            st.success(f"Uploaded & detected {len(names)} field(s)")
+            st.rerun()
+
+        evt = st.session_state.get("wizard_event")
+        if evt:
             st.subheader("Suggestions")
+            for i,t in enumerate(evt["suggested_templates"]):
+                if st.button(f"Use “{t['label']}”", key=f"tpl{i}"):
+                    st.session_state.update(
+                        wiz_sel={"type":"template","value":t},
+                        wizard_step=2
+                    ); st.rerun()
+            if evt["llm_plan"] and st.button("Use AI plan"):
+                st.session_state.update(
+                    wiz_sel={"type":"llm_plan","value":evt["llm_plan"]},
+                    wizard_step=2
+                ); st.rerun()
 
-            # templates
-            for idx, t in enumerate(wiz_evt.get("suggested_templates", [])):
-                if st.button(f"Use “{t['label']}”", key=f"tpl_{idx}"):
-                    log.debug("✔ template picked: %s", t)
-                    st.session_state["wizard_selection"] = {"type": "template", "value": t}
-                    st.session_state["wizard_step"] = 2
-                    st.rerun()
-                st.write(f"- **{t['label']}** — {t['description']}")
-
-            # llm plan
-            llm_plan = wiz_evt.get("llm_plan")
-            if llm_plan:
-                if st.button("Use LLM-recommended plan", key="llm_btn"):
-                    log.debug("✔ llm plan picked")
-                    st.session_state["wizard_selection"] = {"type": "llm_plan", "value": llm_plan}
-                    st.session_state["wizard_step"] = 2
-                    st.rerun()
-                for i, step_desc in enumerate(llm_plan, 1):
-                    st.write(f"{i}. {step_desc.get('label', step_desc.get('type',''))}")
-
-        st.button("Back to Dashboard", on_click=lambda: set_view("dashboard"))
-
+    # Step 2 – required fields
     elif step == 2:
-        st.caption("Step 2 · Field builder (coming soon)")
-        sel = st.session_state.get("wizard_selection")
-        if sel:
-            st.info(f"Selected **{sel['type']}** – {sel['value'].get('label', sel['value'])}")
-        st.button("Back to Dashboard", on_click=lambda: set_view("dashboard"))
+        st.header("Wizard · Step 2 – required fields")
+        if "field_defs" not in st.session_state:
+            st.session_state["field_defs"] = wizard_step_2(
+                st.session_state["wiz_sel"])["required_fields"]
+
+        st.session_state["field_defs"] = render_field_builder(
+            st.session_state["field_defs"])
+
+        if st.button("Save & Continue"):
+            update_fields(st.session_state["draft_id"],
+                          st.session_state["field_defs"], step=2)
+
+            sel = st.session_state["wiz_sel"]
+            if sel["type"] == "template":
+                st.session_state["node_params"] = {"template_id": sel["value"]["template_id"]}
+            else:
+                st.session_state["node_params"] = {}
+
+            st.session_state["wizard_step"] = 4
+            st.success("Fields saved"); st.rerun()
+
+        st.button("← Cancel", on_click=start_new_wizard)
+
+    # Step 3 – publish
+    elif step == 4:
+        st.header("Wizard · Step 3 – publish")
+        if st.button("Publish workflow"):
+            try:
+                task_id = publish_draft(st.session_state["draft_id"])
+                reload_graph()
+                st.success(f"Published! New task id: **{task_id}**")
+            except Exception as e:
+                traceback.print_exc()          # full trace to terminal
+                st.error(f"Publish failed: {e}")
+        st.button("← Dashboard", on_click=start_new_wizard)
 
     else:
-        st.error("Unknown wizard step!")
-        log.error("wizard at unexpected step=%s", step)
+        st.error("Unknown wizard step")
 
-
-# ───── router ───────────────────────────────────────────────────────────
-current_view = st.session_state["view"]
-log.debug("📟 current view: %s", current_view)
-
-if current_view == "dashboard":
-    render_dashboard()
-elif current_view == "wizard":
+# ── router ──────────────────────────────────────────────────────────────
+if st.session_state["view"] == "wizard":
     render_wizard()
 else:
-    st.error(f"Unknown view “{current_view}”")
-    log.error("session in unknown view=%s", current_view)
+    render_dashboard()
 
-st.caption(f"v0.1 · TENANT: {os.getenv('TENANT_ID', 'default')}")
+st.caption(f"v0.7 · TENANT: {os.getenv('TENANT_ID','default')}")
